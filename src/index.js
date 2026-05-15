@@ -1,4 +1,9 @@
-require('dotenv').config();
+// Auto-run migrate and seed on first deploy
+const { execSync } = require('child_process')
+try {
+  execSync('node src/models/migrate.js', { stdio: 'inherit' })
+  execSync('node src/models/seed.js', { stdio: 'inherit' })
+} catch(e) { console.log('Migration skipped:', e.message) }require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
