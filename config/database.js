@@ -18,12 +18,7 @@ pool.on('error', (err) => {
 });
 
 const query = async (text, params) => {
-  const start = Date.now();
   const res = await pool.query(text, params);
-  const duration = Date.now() - start;
-  if (duration > 100) {
-    console.log('Slow query:', { text, duration, rows: res.rowCount });
-  }
   return res;
 };
 
