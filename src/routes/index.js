@@ -303,4 +303,59 @@ router.patch('/employees/:id/reset-password', authenticate, authorize('hr','owne
     res.json({success:true,message:'รีเซ็ตรหัสผ่านสำเร็จ'})
   } catch(err){res.status(500).json({success:false,message:'เกิดข้อผิดพลาด'})}
 })
+// ====== FORGOT PASSWORD / OTP ======
+const { sendOTPEmail } = require('../services/emailService')
+const crypto = require('crypto')
+const otpStore = new Map()
+
+router.post('/auth/forgot-password', async (req, res) => {
+  const { email } = req.body
+  if (!email) return res.status(400).json({ success: false, message: 'กรุณาระบุอีเมล' })
+  try {
+    const result = await query(
+      `SELECT u.id, u.email, u.is_active, CONCAT(e.first_name,' ',e.last_name) as full_name
+       FROM users u LEFT JOIN employees e ON u.id = e.user_id WHERE u.email = $1`,
+      [email.toLowerCase()])
+    if (!result.rows[0] || !result.rows[0].is_active)
+      return res.json({ success: true, message: 'ถ้าอีเมลนี้มีในระบบ จะได้รับ OTP ทางอีเมล' })
+    const otp = Math.floor(100000 + Math.random() * 900000).toString()
+    const expiresAt = Date.now() + 10 * 60 * 1000
+    otpStore.set(email.toLowerCase(), { otp, userId: result.rows[0].id, expiresAt, attempts: 0 })
+    await sendOTPEmail(result.rows[0].email, result.rows[0].full_name || 'ผู้ใช้งาน', otp)
+    res.json({ success: true, message: 'ส่ง OTP ไปที่อีเมลแล้ว' })
+  } catch (err) {
+    console.error('OTP error:', err)
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด กรุณาลองใหม่' })
+  }
+})
+
+router.post('/auth/verify-otp', async (req, res) => {
+  const { email, otp } = req.body
+  const stored = otpStore.get(email?.toLowerCase())
+  if (!stored) return res.status(400).json({ success: false, message: 'ไม่พบคำขอ OTP กรุณาขอใหม่' })
+  if (Date.now() > stored.expiresAt) { otpStore.delete(email.toLowerCase()); return res.status(400).json({ success: false, message: 'OTP หมดอายุ กรุณาขอใหม่' }) }
+  stored.attempts++
+  if (stored.attempts > 5) { otpStore.delete(email.toLowerCase()); return res.status(400).json({ success: false, message: 'ลองผิดหลายครั้ง กรุณาขอ OTP ใหม่' }) }
+  if (stored.otp !== otp) return res.status(400).json({ success: false, message: `OTP ไม่ถูกต้อง (เหลือ ${5 - stored.attempts} ครั้ง)` })
+  const resetToken = crypto.randomBytes(32).toString('hex')
+  stored.resetToken = resetToken
+  stored.verified = true
+  res.json({ success: true, message: 'OTP ถูกต้อง', data: { resetToken } })
+})
+
+router.post('/auth/reset-password', async (req, res) => {
+  const { email, resetToken, newPassword } = req.body
+  if (!email || !resetToken || !newPassword) return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบ' })
+  if (newPassword.length < 6) return res.status(400).json({ success: false, message: 'รหัสผ่านต้องมีอย่างน้อย 6 ตัว' })
+  const stored = otpStore.get(email.toLowerCase())
+  if (!stored || !stored.verified || stored.resetToken !== resetToken)
+    return res.status(400).json({ success: false, message: 'Token ไม่ถูกต้อง กรุณาขอ OTP ใหม่' })
+  try {
+    const bcrypt = require('bcryptjs')
+    const hash = await bcrypt.hash(newPassword, 12)
+    await query('UPDATE users SET password_hash=$1,failed_login_count=0,locked_until=NULL WHERE id=$2', [hash, stored.userId])
+    otpStore.delete(email.toLowerCase())
+    res.json({ success: true, message: 'เปลี่ยนรหัสผ่านสำเร็จ' })
+  } catch (err) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }) }
+})
 module.exports = router;
