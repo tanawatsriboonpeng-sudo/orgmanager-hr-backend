@@ -249,5 +249,58 @@ router.get('/audit-logs', authenticate, authorize('owner', 'hr'), async (req, re
 router.get('/health', (req, res) => {
   res.json({ success: true, message: 'OrgManager HR API is running', version: '1.0.0', timestamp: new Date().toISOString() });
 });
+// ====== EMPLOYEE MANAGEMENT ======
+router.post('/employees/create', authenticate, authorize('hr','owner'), async (req,res) => {
+  const {firstName,lastName,email,employeeId,position,department,role,shiftType,baseSalary,password} = req.body
+  if (!firstName||!lastName||!email||!employeeId||!password)
+    return res.status(400).json({success:false,message:'กรุณากรอกข้อมูลให้ครบ'})
+  try {
+    const bcrypt = require('bcryptjs')
+    const hash = await bcrypt.hash(password,12)
+    const deptRes = await query('SELECT id FROM departments WHERE name=$1',[department])
+    const deptId = deptRes.rows[0]?.id||null
+    const uRes = await query('INSERT INTO users(employee_id,email,password_hash,role) VALUES($1,$2,$3,$4) RETURNING id',[employeeId,email.toLowerCase(),hash,role||'employee'])
+    await query('INSERT INTO employees(user_id,employee_id,first_name,last_name,department_id,position,shift_type,base_salary,start_date) VALUES($1,$2,$3,$4,$5,$6,$7,$8,CURRENT_DATE)',[uRes.rows[0].id,employeeId,firstName,lastName,deptId,position,shiftType||'normal',baseSalary||0])
+    res.status(201).json({success:true,message:`สร้างบัญชี ${firstName} ${lastName} สำเร็จ`})
+  } catch(err) {
+    if(err.code==='23505') return res.status(400).json({success:false,message:'อีเมลหรือรหัสพนักงานซ้ำในระบบ'})
+    res.status(500).json({success:false,message:'เกิดข้อผิดพลาด'})
+  }
+})
 
+router.patch('/employees/:id', authenticate, authorize('hr','owner'), async (req,res) => {
+  const {firstName,lastName,position,department,shiftType,baseSalary,role} = req.body
+  try {
+    const deptRes = await query('SELECT id FROM departments WHERE name=$1',[department])
+    const deptId = deptRes.rows[0]?.id||null
+    await query('UPDATE employees SET first_name=COALESCE($1,first_name),last_name=COALESCE($2,last_name),position=COALESCE($3,position),department_id=COALESCE($4,department_id),shift_type=COALESCE($5,shift_type),base_salary=COALESCE($6,base_salary),updated_at=NOW() WHERE id=$7',[firstName,lastName,position,deptId,shiftType,baseSalary,req.params.id])
+    if(role&&req.user.role==='owner'){const e=await query('SELECT user_id FROM employees WHERE id=$1',[req.params.id]);if(e.rows[0])await query('UPDATE users SET role=$1 WHERE id=$2',[role,e.rows[0].user_id])}
+    res.json({success:true,message:'อัปเดตสำเร็จ'})
+  } catch(err){res.status(500).json({success:false,message:'เกิดข้อผิดพลาด'})}
+})
+
+router.patch('/employees/:id/toggle-active', authenticate, authorize('owner'), async (req,res) => {
+  try {
+    const e = await query('SELECT user_id,is_active FROM employees WHERE id=$1',[req.params.id])
+    if(!e.rows[0]) return res.status(404).json({success:false,message:'ไม่พบพนักงาน'})
+    const active = !e.rows[0].is_active
+    await query('UPDATE employees SET is_active=$1 WHERE id=$2',[active,req.params.id])
+    await query('UPDATE users SET is_active=$1 WHERE id=$2',[active,e.rows[0].user_id])
+    res.json({success:true,message:active?'เปิดใช้งานแล้ว':'ระงับบัญชีแล้ว'})
+  } catch(err){res.status(500).json({success:false,message:'เกิดข้อผิดพลาด'})}
+})
+
+router.patch('/employees/:id/reset-password', authenticate, authorize('hr','owner'), async (req,res) => {
+  const {newPassword} = req.body
+  if(!newPassword||newPassword.length<6)
+    return res.status(400).json({success:false,message:'รหัสผ่านต้องมีอย่างน้อย 6 ตัว'})
+  try {
+    const bcrypt = require('bcryptjs')
+    const e = await query('SELECT user_id FROM employees WHERE id=$1',[req.params.id])
+    if(!e.rows[0]) return res.status(404).json({success:false,message:'ไม่พบพนักงาน'})
+    const hash = await bcrypt.hash(newPassword,12)
+    await query('UPDATE users SET password_hash=$1,failed_login_count=0,locked_until=NULL WHERE id=$2',[hash,e.rows[0].user_id])
+    res.json({success:true,message:'รีเซ็ตรหัสผ่านสำเร็จ'})
+  } catch(err){res.status(500).json({success:false,message:'เกิดข้อผิดพลาด'})}
+})
 module.exports = router;
