@@ -4,11 +4,16 @@ console.log('[EmailService] SMTP_USER:', process.env.SMTP_USER ? 'SET' : 'MISSIN
 console.log('[EmailService] SMTP_PASS:', process.env.SMTP_PASS ? `SET (${process.env.SMTP_PASS.length} chars)` : 'MISSING')
 
 const transporter = nodemailer.createTransport({
-  service: 'gmail',
+  host: 'smtp.gmail.com',
+  port: 587,
+  secure: false,
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
   },
+  connectionTimeout: 10000,
+  greetingTimeout: 10000,
+  socketTimeout: 10000,
 })
 
 transporter.verify((err) => {
@@ -25,10 +30,9 @@ const sendOTPEmail = async (to, name, otp) => {
       subject: 'รหัส OTP สำหรับรีเซ็ตรหัสผ่าน',
       html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px"><div style="background:#1D9E75;padding:20px;border-radius:12px 12px 0 0;text-align:center"><h2 style="color:white;margin:0">🔐 รีเซ็ตรหัสผ่าน</h2><p style="color:rgba(255,255,255,0.8);margin:4px 0 0;font-size:13px">บริษัท สิริคอนส์ คอนสตรัคชั่น จำกัด</p></div><div style="background:#f9f9f9;padding:24px;border-radius:0 0 12px 12px;border:1px solid #eee"><p style="color:#333">สวัสดี <strong>${name}</strong></p><p style="color:#555;font-size:14px">รหัส OTP สำหรับรีเซ็ตรหัสผ่าน:</p><div style="background:white;border:2px solid #1D9E75;border-radius:10px;padding:20px;text-align:center;margin:20px 0"><div style="font-size:36px;font-weight:bold;color:#1D9E75;letter-spacing:8px">${otp}</div><p style="color:#999;font-size:12px;margin:8px 0 0">หมดอายุใน <strong>10 นาที</strong></p></div><p style="color:#888;font-size:12px">หากไม่ได้ขอ กรุณาเพิกเฉย</p></div></div>`,
     })
-    console.log('[sendOTPEmail] SUCCESS:', info.messageId, info.response)
+    console.log('[sendOTPEmail] SUCCESS:', info.messageId)
   } catch (err) {
-    console.error('[sendOTPEmail] FAILED:', err.message)
-    console.error('[sendOTPEmail] code:', err.code, 'command:', err.command)
+    console.error('[sendOTPEmail] FAILED:', err.message, '| code:', err.code)
     throw err
   }
 }
