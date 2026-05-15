@@ -1,0 +1,199 @@
+const { query } = require('../../config/database');
+const dayjs = require('dayjs');
+
+// GET /api/leave/types
+const getLeaveTypes = async (req, res) => {
+  try {
+    const result = await query('SELECT * FROM leave_types WHERE is_active = true ORDER BY name');
+    res.json({ success: true, data: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
+// GET /api/leave/my-quota
+const getMyQuota = async (req, res) => {
+  try {
+    const year = req.query.year || dayjs().year();
+    const empResult = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
+    if (!empResult.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลพนักงาน' });
+
+    const result = await query(
+      `SELECT lq.*, lt.name as leave_type_name, lt.code
+       FROM leave_quotas lq
+       JOIN leave_types lt ON lq.leave_type_id = lt.id
+       WHERE lq.employee_id = $1 AND lq.year = $2`,
+      [empResult.rows[0].id, year]
+    );
+
+    // ถ้ายังไม่มี quota สร้างจาก leave_types default
+    if (result.rows.length === 0) {
+      const types = await query('SELECT * FROM leave_types WHERE is_active = true');
+      const quotaRows = [];
+      for (const lt of types.rows) {
+        if (lt.days_per_year > 0) {
+          const r = await query(
+            'INSERT INTO leave_quotas (employee_id, leave_type_id, year, total_days) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING RETURNING *',
+            [empResult.rows[0].id, lt.id, year, lt.days_per_year]
+          );
+          if (r.rows[0]) quotaRows.push({ ...r.rows[0], leave_type_name: lt.name, code: lt.code });
+        }
+      }
+      return res.json({ success: true, data: quotaRows });
+    }
+
+    res.json({ success: true, data: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
+// POST /api/leave/request
+const createRequest = async (req, res) => {
+  try {
+    const { leaveTypeId, startDate, endDate, reason } = req.body;
+    if (!leaveTypeId || !startDate || !endDate || !reason) {
+      return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลให้ครบ' });
+    }
+
+    const empResult = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
+    if (!empResult.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลพนักงาน' });
+    const empId = empResult.rows[0].id;
+
+    const start = dayjs(startDate);
+    const end = dayjs(endDate);
+    if (end.isBefore(start)) {
+      return res.status(400).json({ success: false, message: 'วันสิ้นสุดต้องหลังวันเริ่มต้น' });
+    }
+
+    // นับวันทำงาน (ไม่นับเสาร์-อาทิตย์)
+    let daysCount = 0;
+    let current = start;
+    while (!current.isAfter(end)) {
+      if (current.day() !== 0 && current.day() !== 6) daysCount++;
+      current = current.add(1, 'day');
+    }
+
+    // ตรวจสอบ quota
+    const quota = await query(
+      'SELECT * FROM leave_quotas WHERE employee_id = $1 AND leave_type_id = $2 AND year = $3',
+      [empId, leaveTypeId, start.year()]
+    );
+
+    if (quota.rows[0] && quota.rows[0].remaining_days < daysCount) {
+      return res.status(400).json({
+        success: false,
+        message: `วันลาไม่พอ (คงเหลือ ${quota.rows[0].remaining_days} วัน แต่ขอ ${daysCount} วัน)`
+      });
+    }
+
+    const result = await query(
+      `INSERT INTO leave_requests (employee_id, leave_type_id, start_date, end_date, days_count, reason)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [empId, leaveTypeId, startDate, endDate, daysCount, reason]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'ยื่นคำขอลาแล้ว รอ HR อนุมัติ',
+      data: { ...result.rows[0], daysCount }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
+// GET /api/leave/pending (HR)
+const getPending = async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT lr.*, lt.name as leave_type_name,
+              e.first_name, e.last_name, e.employee_id as emp_code,
+              d.name as department
+       FROM leave_requests lr
+       JOIN employees e ON lr.employee_id = e.id
+       JOIN leave_types lt ON lr.leave_type_id = lt.id
+       LEFT JOIN departments d ON e.department_id = d.id
+       WHERE lr.status = 'pending'
+       ORDER BY lr.created_at ASC`
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
+// PATCH /api/leave/:id/approve
+const approveRequest = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { action, hrNotes } = req.body; // action: 'approved' | 'rejected'
+
+    const leaveResult = await query('SELECT * FROM leave_requests WHERE id = $1', [id]);
+    if (!leaveResult.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบคำขอ' });
+    const leave = leaveResult.rows[0];
+
+    if (leave.status !== 'pending') {
+      return res.status(400).json({ success: false, message: 'คำขอนี้ดำเนินการไปแล้ว' });
+    }
+
+    await query(
+      'UPDATE leave_requests SET status = $1, approved_by = $2, approved_at = NOW(), hr_notes = $3, updated_at = NOW() WHERE id = $4',
+      [action, req.user.id, hrNotes, id]
+    );
+
+    // อัปเดต quota ถ้าอนุมัติ
+    if (action === 'approved') {
+      await query(
+        `UPDATE leave_quotas SET used_days = used_days + $1
+         WHERE employee_id = $2 AND leave_type_id = $3
+         AND year = EXTRACT(YEAR FROM $4::date)`,
+        [leave.days_count, leave.employee_id, leave.leave_type_id, leave.start_date]
+      );
+
+      // บันทึก attendance_logs เป็น leave
+      let current = dayjs(leave.start_date);
+      const end = dayjs(leave.end_date);
+      while (!current.isAfter(end)) {
+        if (current.day() !== 0 && current.day() !== 6) {
+          await query(
+            `INSERT INTO attendance_logs (employee_id, date, status, status_detail)
+             VALUES ($1, $2, 'leave', 'ลาที่ได้รับอนุมัติ')
+             ON CONFLICT (employee_id, date) DO UPDATE SET status = 'leave', status_detail = 'ลาที่ได้รับอนุมัติ'`,
+            [leave.employee_id, current.format('YYYY-MM-DD')]
+          );
+        }
+        current = current.add(1, 'day');
+      }
+    }
+
+    res.json({
+      success: true,
+      message: action === 'approved' ? 'อนุมัติคำขอลาแล้ว' : 'ปฏิเสธคำขอลาแล้ว'
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
+// GET /api/leave/my-history
+const getMyHistory = async (req, res) => {
+  try {
+    const empResult = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
+    if (!empResult.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลพนักงาน' });
+
+    const result = await query(
+      `SELECT lr.*, lt.name as leave_type_name
+       FROM leave_requests lr
+       JOIN leave_types lt ON lr.leave_type_id = lt.id
+       WHERE lr.employee_id = $1
+       ORDER BY lr.created_at DESC LIMIT 50`,
+      [empResult.rows[0].id]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
+module.exports = { getLeaveTypes, getMyQuota, createRequest, getPending, approveRequest, getMyHistory };
