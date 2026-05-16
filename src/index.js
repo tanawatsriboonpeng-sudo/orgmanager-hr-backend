@@ -56,6 +56,28 @@ async function ensureSchema() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_shift_assignments_employee_date ON shift_assignments(employee_id, date)
     `);
+    // shift_configs may not exist on legacy databases that were created
+    // before this table was added to migrate.js. Create it defensively.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS shift_configs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(100) NOT NULL,
+        shift_type VARCHAR(20) NOT NULL,
+        description TEXT,
+        work_days INTEGER[] NOT NULL DEFAULT ARRAY[1,2,3,4,5],
+        checkin_start TIME NOT NULL DEFAULT '08:30',
+        checkin_end TIME NOT NULL DEFAULT '10:00',
+        work_start TIME NOT NULL DEFAULT '09:00',
+        work_end TIME NOT NULL DEFAULT '17:00',
+        grace_minutes INT DEFAULT 0,
+        late_warning_minutes INT DEFAULT 1,
+        late_threshold_minutes INT DEFAULT 10,
+        absent_threshold_minutes INT DEFAULT 20,
+        flex_tiers JSONB DEFAULT '[]'::jsonb,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
     // late_warning_minutes = how many minutes after work_start counts as
     // "เกือบสาย" (between grace_minutes and late_threshold_minutes).
     // flex_tiers = JSON array of {checkin_until: "HH:MM", checkout: "HH:MM"}
