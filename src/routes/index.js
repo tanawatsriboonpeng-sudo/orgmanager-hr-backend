@@ -75,15 +75,93 @@ router.post('/ot/request', authenticate, async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
 });
 
-router.patch('/ot/:id/approve', authenticate, authorize('hr'), async (req, res) => {
+// Owner included as failsafe approver for companies without dedicated HR
+// (mirrors the /leave approval setup).
+router.patch('/ot/:id/approve', authenticate, authorize('hr', 'owner'), async (req, res) => {
   try {
-    const { action } = req.body;
+    const { action, rejectedReason } = req.body;
+    if (action !== 'approved' && action !== 'rejected') {
+      return res.status(400).json({ success: false, message: 'action ไม่ถูกต้อง' });
+    }
+    const existing = await query('SELECT status FROM ot_requests WHERE id = $1', [req.params.id]);
+    if (!existing.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบคำขอ' });
+    if (existing.rows[0].status !== 'pending' && existing.rows[0].status !== 'manager_approved') {
+      return res.status(400).json({ success: false, message: 'คำขอนี้ดำเนินการไปแล้ว' });
+    }
     await query(
-      'UPDATE ot_requests SET status = $1, hr_approved_by = $2, hr_approved_at = NOW(), updated_at = NOW() WHERE id = $3',
-      [action === 'approved' ? 'hr_approved' : 'rejected', req.user.id, req.params.id]
+      `UPDATE ot_requests SET
+         status = $1,
+         hr_approved_by = $2,
+         hr_approved_at = NOW(),
+         rejected_reason = $3,
+         updated_at = NOW()
+       WHERE id = $4`,
+      [
+        action === 'approved' ? 'hr_approved' : 'rejected',
+        req.user.id,
+        action === 'rejected' ? (rejectedReason || null) : null,
+        req.params.id,
+      ]
     );
     res.json({ success: true, message: action === 'approved' ? 'อนุมัติ OT แล้ว' : 'ปฏิเสธ OT แล้ว' });
-  } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
+  } catch (e) {
+    console.error('PATCH /ot/:id/approve error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// Employee's own OT history with approver name joined.
+router.get('/ot/my-history', authenticate, async (req, res) => {
+  try {
+    const emp = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
+    if (!emp.rows[0]) return res.json({ success: true, data: [] });
+    const r = await query(
+      `SELECT o.*,
+              approver_emp.first_name AS approver_first_name,
+              approver_emp.last_name  AS approver_last_name,
+              approver_emp.nickname   AS approver_nickname
+       FROM ot_requests o
+       LEFT JOIN users approver_u ON o.hr_approved_by = approver_u.id
+       LEFT JOIN employees approver_emp ON approver_emp.user_id = approver_u.id
+       WHERE o.employee_id = $1
+       ORDER BY o.created_at DESC
+       LIMIT 100`,
+      [emp.rows[0].id]
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (e) {
+    console.error('GET /ot/my-history error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// Employee self-cancel — only while still pending (not yet approved /
+// rejected / cancelled).
+router.post('/ot/:id/cancel', authenticate, async (req, res) => {
+  try {
+    const emp = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
+    if (!emp.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบพนักงาน' });
+    const r = await query('SELECT employee_id, status FROM ot_requests WHERE id = $1', [req.params.id]);
+    if (!r.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบคำขอ' });
+    if (r.rows[0].employee_id !== emp.rows[0].id) {
+      return res.status(403).json({ success: false, message: 'ยกเลิกได้เฉพาะคำขอของตัวเอง' });
+    }
+    if (r.rows[0].status !== 'pending') {
+      return res.status(400).json({ success: false, message: 'ยกเลิกได้เฉพาะคำขอที่ยังรออนุมัติ' });
+    }
+    // ot_requests.status CHECK constraint allows ('pending','manager_approved','hr_approved','rejected')
+    // — no 'cancelled' state yet, so we record cancellation as 'rejected'
+    // with a sentinel reason. (If we relax the CHECK constraint later we
+    // can switch to a true 'cancelled' value.)
+    await query(
+      `UPDATE ot_requests SET status = 'rejected', rejected_reason = $1, updated_at = NOW() WHERE id = $2`,
+      ['ยกเลิกโดยพนักงาน', req.params.id]
+    );
+    res.json({ success: true, message: 'ยกเลิกคำขอ OT แล้ว' });
+  } catch (e) {
+    console.error('POST /ot/:id/cancel error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
 });
 
 // ====== EMPLOYEES ======
