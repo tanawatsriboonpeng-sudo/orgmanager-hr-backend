@@ -648,6 +648,30 @@ router.patch('/employees/:id', authenticate, authorize('hr','owner'), async (req
   }
 })
 
+// Bulk update weekly_shifts — used by the recurring "ตารางรายสัปดาห์"
+// grid. Each item: { employeeId, weeklyShifts: { "0": "WC001"|"dayoff", ... } }
+router.post('/employees/weekly-shifts/bulk', authenticate, authorize('hr','owner'), async (req, res) => {
+  const { items } = req.body
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ success: false, message: 'ไม่มีข้อมูล' })
+  }
+  try {
+    let updated = 0
+    for (const it of items) {
+      if (!it.employeeId || typeof it.weeklyShifts !== 'object' || it.weeklyShifts === null) continue
+      await query(
+        'UPDATE employees SET weekly_shifts = $1::jsonb, updated_at = NOW() WHERE id = $2',
+        [JSON.stringify(it.weeklyShifts), it.employeeId]
+      )
+      updated++
+    }
+    res.json({ success: true, message: `บันทึก ${updated} คน`, data: { updated } })
+  } catch (e) {
+    console.error('POST /employees/weekly-shifts/bulk error:', e.message)
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' })
+  }
+})
+
 // Bulk update work_days for many employees at once — used by the
 // "วันทำงาน/วันหยุด" grid which lets HR change several rows then save once.
 router.post('/employees/work-days/bulk', authenticate, authorize('hr','owner'), async (req, res) => {

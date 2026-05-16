@@ -124,6 +124,16 @@ async function ensureSchema() {
       ALTER TABLE employees
       ADD COLUMN IF NOT EXISTS work_days INTEGER[] DEFAULT ARRAY[1,2,3,4,5]
     `);
+    // employees.weekly_shifts is the recurring weekly schedule. JSON shape:
+    //   { "0": "dayoff", "1": "WC001", "2": "WC001", ..., "6": "dayoff" }
+    // Keys are day-of-week numbers (0=Sun..6=Sat). Values are either a
+    // shift_configs.code or the string "dayoff". Missing keys default to
+    // "dayoff" on the frontend. Replaces the per-date shift_assignments
+    // approach for the weekly grid.
+    await client.query(`
+      ALTER TABLE employees
+      ADD COLUMN IF NOT EXISTS weekly_shifts JSONB DEFAULT '{}'::jsonb
+    `);
     console.log('🔧 schema check ok');
   } catch (e) {
     console.error('⚠️  schema check failed:', e.message);
