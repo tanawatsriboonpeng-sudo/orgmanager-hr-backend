@@ -7,6 +7,7 @@
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
     "migrate": "node src/models/migrate.js",
+    "migrate:v2": "node src/models/migrate-v2.js",
     "seed": "node src/models/seed.js"
   },
   "dependencies": {

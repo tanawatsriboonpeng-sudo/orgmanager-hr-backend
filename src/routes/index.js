@@ -75,10 +75,13 @@ router.patch('/ot/:id/approve', authenticate, authorize('hr'), async (req, res) 
 router.get('/employees', authenticate, authorize('hr', 'owner'), async (req, res) => {
   try {
     const result = await query(
-      `SELECT e.*, u.email, u.role, u.is_active as account_active, u.last_login_at, d.name as department_name
+      `SELECT e.*, u.email, u.role, u.is_active as account_active, u.last_login_at,
+              d.name as department_name,
+              m.first_name as manager_first_name, m.last_name as manager_last_name
        FROM employees e
        LEFT JOIN users u ON e.user_id = u.id
        LEFT JOIN departments d ON e.department_id = d.id
+       LEFT JOIN employees m ON e.manager_id = m.id
        WHERE e.is_active = true
        ORDER BY e.first_name`
     );
@@ -89,15 +92,116 @@ router.get('/employees', authenticate, authorize('hr', 'owner'), async (req, res
 router.get('/employees/me', authenticate, async (req, res) => {
   try {
     const result = await query(
-      `SELECT e.*, u.email, d.name as department_name
+      `SELECT e.*, u.email, d.name as department_name,
+              m.first_name as manager_first_name, m.last_name as manager_last_name
        FROM employees e
        LEFT JOIN users u ON e.user_id = u.id
        LEFT JOIN departments d ON e.department_id = d.id
+       LEFT JOIN employees m ON e.manager_id = m.id
        WHERE e.user_id = $1`,
       [req.user.id]
     );
     res.json({ success: true, data: result.rows[0] });
   } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
+});
+
+// Self-edit (employee can update own non-sensitive fields)
+router.patch('/employees/me', authenticate, async (req, res) => {
+  const { nickname, phone, avatarUrl } = req.body;
+  // Avatar size guard: base64 strings can be huge. Reject anything > ~700 KB
+  // which is roughly a 500 KB image after base64 inflation.
+  if (avatarUrl && typeof avatarUrl === 'string' && avatarUrl.length > 700 * 1024) {
+    return res.status(413).json({ success: false, message: 'รูปภาพใหญ่เกินไป (สูงสุด ~500KB)' });
+  }
+  try {
+    await query(
+      `UPDATE employees SET
+         nickname = COALESCE($1, nickname),
+         phone = COALESCE($2, phone),
+         avatar_url = COALESCE($3, avatar_url),
+         updated_at = NOW()
+       WHERE user_id = $4`,
+      [nickname ?? null, phone ?? null, avatarUrl ?? null, req.user.id]
+    );
+    res.json({ success: true, message: 'อัปเดตข้อมูลส่วนตัวแล้ว' });
+  } catch (e) {
+    console.error('PATCH /employees/me error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// ====== DEPARTMENTS ======
+router.get('/departments', authenticate, async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT d.id, d.name, d.description, d.manager_id,
+              CONCAT(m.first_name, ' ', m.last_name) as manager_name,
+              (SELECT COUNT(*) FROM employees e WHERE e.department_id = d.id AND e.is_active = true) as member_count
+       FROM departments d
+       LEFT JOIN employees m ON d.manager_id = m.id
+       ORDER BY d.name`
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (e) {
+    console.error('GET /departments error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.post('/departments', authenticate, authorize('hr', 'owner'), async (req, res) => {
+  const { name, description, managerId } = req.body;
+  if (!name || !name.trim()) {
+    return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อแผนก' });
+  }
+  try {
+    const r = await query(
+      'INSERT INTO departments (name, description, manager_id) VALUES ($1, $2, $3) RETURNING *',
+      [name.trim(), description || null, managerId || null]
+    );
+    res.status(201).json({ success: true, message: 'สร้างแผนกแล้ว', data: r.rows[0] });
+  } catch (err) {
+    if (err.code === '23505') return res.status(400).json({ success: false, message: 'มีแผนกชื่อนี้อยู่แล้ว' });
+    console.error('POST /departments error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.patch('/departments/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
+  const { name, description, managerId } = req.body;
+  try {
+    await query(
+      `UPDATE departments SET
+         name = COALESCE($1, name),
+         description = COALESCE($2, description),
+         manager_id = $3
+       WHERE id = $4`,
+      [name, description, managerId || null, req.params.id]
+    );
+    res.json({ success: true, message: 'อัปเดตแผนกแล้ว' });
+  } catch (e) {
+    console.error('PATCH /departments/:id error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.delete('/departments/:id', authenticate, authorize('owner'), async (req, res) => {
+  try {
+    const inUse = await query(
+      'SELECT COUNT(*)::int as count FROM employees WHERE department_id = $1 AND is_active = true',
+      [req.params.id]
+    );
+    if (inUse.rows[0].count > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `ลบไม่ได้ มีพนักงานในแผนกนี้อยู่ ${inUse.rows[0].count} คน — กรุณาย้ายออกก่อน`
+      });
+    }
+    await query('DELETE FROM departments WHERE id = $1', [req.params.id]);
+    res.json({ success: true, message: 'ลบแผนกแล้ว' });
+  } catch (e) {
+    console.error('DELETE /departments/:id error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
 });
 
 // ====== HOLIDAYS ======
@@ -269,14 +373,65 @@ router.post('/employees/create', authenticate, authorize('hr','owner'), async (r
 })
 
 router.patch('/employees/:id', authenticate, authorize('hr','owner'), async (req,res) => {
-  const {firstName,lastName,position,department,shiftType,baseSalary,role} = req.body
+  const {
+    firstName, lastName, nickname, phone,
+    position, department, shiftType, baseSalary, role,
+    managerId, avatarUrl,
+    bankAccount, bankName, nationalId
+  } = req.body
+  // Avatar size guard
+  if (avatarUrl && typeof avatarUrl === 'string' && avatarUrl.length > 700 * 1024) {
+    return res.status(413).json({ success: false, message: 'รูปภาพใหญ่เกินไป (สูงสุด ~500KB)' });
+  }
   try {
-    const deptRes = await query('SELECT id FROM departments WHERE name=$1',[department])
-    const deptId = deptRes.rows[0]?.id||null
-    await query('UPDATE employees SET first_name=COALESCE($1,first_name),last_name=COALESCE($2,last_name),position=COALESCE($3,position),department_id=COALESCE($4,department_id),shift_type=COALESCE($5,shift_type),base_salary=COALESCE($6,base_salary),updated_at=NOW() WHERE id=$7',[firstName,lastName,position,deptId,shiftType,baseSalary,req.params.id])
-    if(role&&req.user.role==='owner'){const e=await query('SELECT user_id FROM employees WHERE id=$1',[req.params.id]);if(e.rows[0])await query('UPDATE users SET role=$1 WHERE id=$2',[role,e.rows[0].user_id])}
-    res.json({success:true,message:'อัปเดตสำเร็จ'})
-  } catch(err){res.status(500).json({success:false,message:'เกิดข้อผิดพลาด'})}
+    // Resolve department by name → id (department arrives as name from UI)
+    let deptId = null
+    if (department !== undefined && department !== null) {
+      const deptRes = await query('SELECT id FROM departments WHERE name=$1', [department])
+      deptId = deptRes.rows[0]?.id || null
+    }
+
+    // Prevent setting manager_id to self (would create a self-loop)
+    let resolvedManagerId = managerId
+    if (resolvedManagerId === '' || resolvedManagerId === undefined) resolvedManagerId = null
+    if (resolvedManagerId && resolvedManagerId === req.params.id) {
+      return res.status(400).json({ success: false, message: 'ไม่สามารถตั้งตัวเองเป็นผู้บังคับบัญชาได้' })
+    }
+
+    await query(
+      `UPDATE employees SET
+         first_name = COALESCE($1, first_name),
+         last_name  = COALESCE($2, last_name),
+         nickname   = COALESCE($3, nickname),
+         phone      = COALESCE($4, phone),
+         position   = COALESCE($5, position),
+         department_id = COALESCE($6, department_id),
+         shift_type    = COALESCE($7, shift_type),
+         base_salary   = COALESCE($8, base_salary),
+         manager_id    = $9,
+         avatar_url    = COALESCE($10, avatar_url),
+         bank_account  = COALESCE($11, bank_account),
+         bank_name     = COALESCE($12, bank_name),
+         national_id   = COALESCE($13, national_id),
+         updated_at = NOW()
+       WHERE id = $14`,
+      [firstName, lastName, nickname, phone,
+       position, deptId, shiftType, baseSalary,
+       resolvedManagerId, avatarUrl,
+       bankAccount, bankName, nationalId,
+       req.params.id]
+    )
+
+    // Role change is owner-only
+    if (role && req.user.role === 'owner') {
+      const e = await query('SELECT user_id FROM employees WHERE id=$1', [req.params.id])
+      if (e.rows[0]) await query('UPDATE users SET role=$1 WHERE id=$2', [role, e.rows[0].user_id])
+    }
+    res.json({success:true, message:'อัปเดตสำเร็จ'})
+  } catch (err) {
+    console.error('PATCH /employees/:id error:', err.message)
+    res.status(500).json({success:false, message:'เกิดข้อผิดพลาด'})
+  }
 })
 
 router.patch('/employees/:id/toggle-active', authenticate, authorize('owner'), async (req,res) => {
