@@ -920,6 +920,329 @@ router.patch('/employees/:id/reset-password', authenticate, authorize('hr','owne
     res.json({success:true,message:'รีเซ็ตรหัสผ่านสำเร็จ'})
   } catch(err){res.status(500).json({success:false,message:'เกิดข้อผิดพลาด'})}
 })
+// ====== PAYROLL ======
+// payroll_records is the master table of monthly slips. One row per
+// (employee, month, year). net_salary is a GENERATED column computed by
+// Postgres from base_salary + ot_amount + bonus + allowances minus
+// social_security + income_tax + other_deductions, so the UI never has to
+// keep it in sync — just update inputs and re-read.
+//
+// Status flow: draft → approved → paid. HR creates as draft, then approves
+// (signals "amounts locked in"), then marks-paid (signals "money sent" and
+// stamps paid_at). Going backwards is allowed via PATCH.
+
+// Helper: HR/owner can act on any record; employee can only read their own.
+async function resolveOwnEmployeeId(userId) {
+  const r = await query('SELECT id FROM employees WHERE user_id = $1', [userId]);
+  return r.rows[0]?.id || null;
+}
+
+// GET /payroll — list. HR/owner see everyone; employee sees self only.
+// Optional filters: month, year, status, employeeId.
+router.get('/payroll', authenticate, async (req, res) => {
+  const { month, year, status, employeeId } = req.query;
+  try {
+    const where = [];
+    const params = [];
+    const push = (clause, value) => { params.push(value); where.push(clause.replace('$$', `$${params.length}`)); };
+
+    if (req.user.role !== 'hr' && req.user.role !== 'owner') {
+      const ownId = await resolveOwnEmployeeId(req.user.id);
+      if (!ownId) return res.json({ success: true, data: [] });
+      push('p.employee_id = $$', ownId);
+    } else if (employeeId) {
+      push('p.employee_id = $$', employeeId);
+    }
+    if (month) push('p.month = $$', parseInt(month, 10));
+    if (year)  push('p.year = $$',  parseInt(year, 10));
+    if (status) push('p.status = $$', status);
+
+    const sql = `
+      SELECT p.*,
+             e.first_name, e.last_name, e.nickname, e.avatar_url,
+             e.employee_id AS emp_code, e.position,
+             d.name AS department_name
+      FROM payroll_records p
+      JOIN employees e ON p.employee_id = e.id
+      LEFT JOIN departments d ON e.department_id = d.id
+      ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+      ORDER BY p.year DESC, p.month DESC, e.first_name`;
+    const r = await query(sql, params);
+    res.json({ success: true, data: r.rows });
+  } catch (e) {
+    console.error('GET /payroll error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// GET /payroll/:id — single slip. Employees can only read their own.
+router.get('/payroll/:id', authenticate, async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT p.*,
+              e.first_name, e.last_name, e.nickname, e.avatar_url,
+              e.employee_id AS emp_code, e.position,
+              e.bank_account, e.bank_name, e.bank_branch_code,
+              d.name AS department_name
+       FROM payroll_records p
+       JOIN employees e ON p.employee_id = e.id
+       LEFT JOIN departments d ON e.department_id = d.id
+       WHERE p.id = $1`,
+      [req.params.id]
+    );
+    const slip = r.rows[0];
+    if (!slip) return res.status(404).json({ success: false, message: 'ไม่พบสลิป' });
+    if (req.user.role !== 'hr' && req.user.role !== 'owner') {
+      const ownId = await resolveOwnEmployeeId(req.user.id);
+      if (slip.employee_id !== ownId) {
+        return res.status(403).json({ success: false, message: 'ไม่มีสิทธิ์ดู' });
+      }
+    }
+    res.json({ success: true, data: slip });
+  } catch (e) {
+    console.error('GET /payroll/:id error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// POST /payroll — HR/owner creates one slip manually.
+router.post('/payroll', authenticate, authorize('hr', 'owner'), async (req, res) => {
+  const {
+    employeeId, month, year,
+    baseSalary, otAmount, bonus, allowances,
+    socialSecurity, incomeTax, otherDeductions,
+    workDays, absentDays, lateCount, otHours,
+    notes,
+  } = req.body;
+  if (!employeeId || !month || !year || baseSalary === undefined || baseSalary === null) {
+    return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบ (employeeId, month, year, baseSalary จำเป็น)' });
+  }
+  try {
+    const r = await query(
+      `INSERT INTO payroll_records (
+         employee_id, month, year,
+         base_salary, ot_amount, bonus, allowances,
+         social_security, income_tax, other_deductions,
+         work_days, absent_days, late_count, ot_hours,
+         notes, created_by
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+       RETURNING *`,
+      [employeeId, month, year,
+       baseSalary, otAmount || 0, bonus || 0, allowances || 0,
+       socialSecurity || 0, incomeTax || 0, otherDeductions || 0,
+       workDays ?? null, absentDays || 0, lateCount || 0, otHours || 0,
+       notes || null, req.user.id]
+    );
+    res.status(201).json({ success: true, message: 'สร้างสลิปแล้ว', data: r.rows[0] });
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ success: false, message: 'มีสลิปของพนักงานคนนี้สำหรับเดือน/ปีนี้แล้ว' });
+    }
+    console.error('POST /payroll error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// PATCH /payroll/:id — HR/owner edits. Disallow edits when status='paid'.
+router.patch('/payroll/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
+  const {
+    baseSalary, otAmount, bonus, allowances,
+    socialSecurity, incomeTax, otherDeductions,
+    workDays, absentDays, lateCount, otHours,
+    notes, status,
+  } = req.body;
+  try {
+    const existing = await query('SELECT status FROM payroll_records WHERE id = $1', [req.params.id]);
+    if (!existing.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบสลิป' });
+    if (existing.rows[0].status === 'paid' && status !== 'draft' && status !== 'approved') {
+      return res.status(400).json({ success: false, message: 'สลิปที่จ่ายแล้วไม่สามารถแก้ไขได้ (เปลี่ยนสถานะกลับก่อน)' });
+    }
+    if (status && !['draft','approved','paid'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'สถานะไม่ถูกต้อง' });
+    }
+    await query(
+      `UPDATE payroll_records SET
+         base_salary       = COALESCE($1,  base_salary),
+         ot_amount         = COALESCE($2,  ot_amount),
+         bonus             = COALESCE($3,  bonus),
+         allowances        = COALESCE($4,  allowances),
+         social_security   = COALESCE($5,  social_security),
+         income_tax        = COALESCE($6,  income_tax),
+         other_deductions  = COALESCE($7,  other_deductions),
+         work_days         = COALESCE($8,  work_days),
+         absent_days       = COALESCE($9,  absent_days),
+         late_count        = COALESCE($10, late_count),
+         ot_hours          = COALESCE($11, ot_hours),
+         notes             = COALESCE($12, notes),
+         status            = COALESCE($13, status),
+         paid_at           = CASE WHEN $13 = 'paid' THEN COALESCE(paid_at, NOW())
+                                  WHEN $13 IS NOT NULL AND $13 <> 'paid' THEN NULL
+                                  ELSE paid_at END,
+         updated_at        = NOW()
+       WHERE id = $14`,
+      [baseSalary ?? null, otAmount ?? null, bonus ?? null, allowances ?? null,
+       socialSecurity ?? null, incomeTax ?? null, otherDeductions ?? null,
+       workDays ?? null, absentDays ?? null, lateCount ?? null, otHours ?? null,
+       notes ?? null, status ?? null, req.params.id]
+    );
+    res.json({ success: true, message: 'อัปเดตสลิปแล้ว' });
+  } catch (err) {
+    console.error('PATCH /payroll/:id error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// DELETE /payroll/:id — HR/owner deletes. Only allowed when status='draft'.
+router.delete('/payroll/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
+  try {
+    const existing = await query('SELECT status FROM payroll_records WHERE id = $1', [req.params.id]);
+    if (!existing.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบสลิป' });
+    if (existing.rows[0].status !== 'draft') {
+      return res.status(400).json({ success: false, message: 'ลบได้เฉพาะสลิปสถานะ "ร่าง" เท่านั้น' });
+    }
+    await query('DELETE FROM payroll_records WHERE id = $1', [req.params.id]);
+    res.json({ success: true, message: 'ลบสลิปแล้ว' });
+  } catch (err) {
+    console.error('DELETE /payroll/:id error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// POST /payroll/:id/approve — flip status from draft → approved.
+router.post('/payroll/:id/approve', authenticate, authorize('hr', 'owner'),
+  auditLog('payroll_approve', 'payroll_records'),
+  async (req, res) => {
+  try {
+    const r = await query(
+      `UPDATE payroll_records SET status = 'approved', updated_at = NOW()
+       WHERE id = $1 AND status = 'draft' RETURNING id`,
+      [req.params.id]
+    );
+    if (!r.rows[0]) return res.status(400).json({ success: false, message: 'อนุมัติได้เฉพาะสลิปร่าง' });
+    res.json({ success: true, message: 'อนุมัติสลิปแล้ว', data: { id: r.rows[0].id } });
+  } catch (err) {
+    console.error('POST /payroll/:id/approve error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// POST /payroll/:id/mark-paid — flip status from approved → paid + stamp paid_at.
+router.post('/payroll/:id/mark-paid', authenticate, authorize('hr', 'owner'),
+  auditLog('payroll_mark_paid', 'payroll_records'),
+  async (req, res) => {
+  try {
+    const r = await query(
+      `UPDATE payroll_records SET status = 'paid', paid_at = NOW(), updated_at = NOW()
+       WHERE id = $1 AND status = 'approved' RETURNING id`,
+      [req.params.id]
+    );
+    if (!r.rows[0]) return res.status(400).json({ success: false, message: 'จ่ายได้เฉพาะสลิปที่อนุมัติแล้ว' });
+    res.json({ success: true, message: 'ทำเครื่องหมายจ่ายแล้ว', data: { id: r.rows[0].id } });
+  } catch (err) {
+    console.error('POST /payroll/:id/mark-paid error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// POST /payroll/bulk-generate — generate draft slips for every active
+// non-owner employee for a given month/year. Seeds work_days / absent_days
+// / late_count from attendance_logs and ot_hours/ot_amount from approved
+// ot_requests. Idempotent: skips employees who already have a slip for
+// that period (so HR can re-run safely if new employees were added).
+//
+// Formulas (Thai labor standard, HR can override per-slip after):
+//   ot_amount       = round(ot_hours × base_salary / 240 × 1.5, 2)
+//   social_security = min(base_salary × 0.05, 750)
+// bonus/allowances/income_tax/other_deductions all default to 0.
+router.post('/payroll/bulk-generate', authenticate, authorize('hr', 'owner'),
+  auditLog('payroll_bulk_generate', 'payroll_records'),
+  async (req, res) => {
+  const { month, year } = req.body;
+  if (!month || !year) {
+    return res.status(400).json({ success: false, message: 'กรุณาระบุเดือนและปี' });
+  }
+  const m = parseInt(month, 10);
+  const y = parseInt(year, 10);
+  if (m < 1 || m > 12 || y < 2000 || y > 2200) {
+    return res.status(400).json({ success: false, message: 'เดือนหรือปีไม่ถูกต้อง' });
+  }
+  // Period bounds (inclusive). Use first/last day of the month.
+  const startDate = `${y}-${String(m).padStart(2, '0')}-01`;
+  const endDate = new Date(y, m, 0); // last day of month m
+  const endDateStr = `${y}-${String(m).padStart(2, '0')}-${String(endDate.getDate()).padStart(2, '0')}`;
+
+  try {
+    // Pull every active non-owner employee with a base_salary.
+    const empRows = await query(
+      `SELECT e.id, e.base_salary
+       FROM employees e
+       LEFT JOIN users u ON e.user_id = u.id
+       WHERE e.is_active = true
+         AND (u.role IS NULL OR u.role <> 'owner')
+         AND e.base_salary IS NOT NULL`
+    );
+
+    let created = 0, skipped = 0;
+    for (const emp of empRows.rows) {
+      // Skip if slip already exists for this period.
+      const dup = await query(
+        'SELECT 1 FROM payroll_records WHERE employee_id=$1 AND month=$2 AND year=$3',
+        [emp.id, m, y]
+      );
+      if (dup.rows[0]) { skipped++; continue; }
+
+      // Attendance buckets for the period.
+      const attRows = await query(
+        `SELECT
+           COUNT(*) FILTER (WHERE status IN ('present','late','very_late'))::int AS work_days,
+           COUNT(*) FILTER (WHERE status = 'absent')::int                       AS absent_days,
+           COUNT(*) FILTER (WHERE status IN ('late','very_late'))::int          AS late_count
+         FROM attendance_logs
+         WHERE employee_id = $1 AND date BETWEEN $2 AND $3`,
+        [emp.id, startDate, endDateStr]
+      );
+      const att = attRows.rows[0] || { work_days: 0, absent_days: 0, late_count: 0 };
+
+      // Approved OT hours for the period (status='hr_approved').
+      const otRows = await query(
+        `SELECT COALESCE(SUM(hours),0)::numeric AS ot_hours
+         FROM ot_requests
+         WHERE employee_id = $1
+           AND date BETWEEN $2 AND $3
+           AND status = 'hr_approved'`,
+        [emp.id, startDate, endDateStr]
+      );
+      const otHours = Number(otRows.rows[0]?.ot_hours || 0);
+
+      const base = Number(emp.base_salary);
+      const otAmount = +(otHours * (base / 240) * 1.5).toFixed(2);
+      const ss = +Math.min(base * 0.05, 750).toFixed(2);
+
+      await query(
+        `INSERT INTO payroll_records (
+           employee_id, month, year,
+           base_salary, ot_amount, social_security,
+           work_days, absent_days, late_count, ot_hours,
+           created_by
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+        [emp.id, m, y,
+         base, otAmount, ss,
+         att.work_days, att.absent_days, att.late_count, otHours,
+         req.user.id]
+      );
+      created++;
+    }
+    res.status(201).json({
+      success: true,
+      message: `สร้างสลิปแล้ว ${created} รายการ (ข้าม ${skipped} ที่มีอยู่แล้ว)`,
+      data: { created, skipped, month: m, year: y }
+    });
+  } catch (err) {
+    console.error('POST /payroll/bulk-generate error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
 // ====== FORGOT PASSWORD / OTP ======
 const { sendOTPEmail } = require('../services/emailService')
 const crypto = require('crypto')

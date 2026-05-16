@@ -200,6 +200,45 @@ async function ensureSchema() {
         `ALTER TABLE employees ADD COLUMN IF NOT EXISTS ${name} ${type}`
       );
     }
+    // Payroll. Legacy DBs created before migrate.js added payroll_records
+    // won't have this table, so create it defensively on every boot.
+    // net_salary is a GENERATED column — Postgres recomputes it on every
+    // UPDATE so the UI never has to worry about keeping it in sync.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS payroll_records (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        employee_id UUID REFERENCES employees(id) ON DELETE CASCADE,
+        month INT NOT NULL,
+        year INT NOT NULL,
+        base_salary NUMERIC(12,2) NOT NULL,
+        ot_amount NUMERIC(12,2) DEFAULT 0,
+        bonus NUMERIC(12,2) DEFAULT 0,
+        allowances NUMERIC(12,2) DEFAULT 0,
+        social_security NUMERIC(12,2) DEFAULT 0,
+        income_tax NUMERIC(12,2) DEFAULT 0,
+        other_deductions NUMERIC(12,2) DEFAULT 0,
+        net_salary NUMERIC(12,2) GENERATED ALWAYS AS
+          (base_salary + ot_amount + bonus + allowances - social_security - income_tax - other_deductions) STORED,
+        work_days INT,
+        absent_days INT DEFAULT 0,
+        late_count INT DEFAULT 0,
+        ot_hours NUMERIC(5,2) DEFAULT 0,
+        status VARCHAR(20) DEFAULT 'draft' CHECK (status IN ('draft','approved','paid')),
+        paid_at TIMESTAMPTZ,
+        slip_sent_at TIMESTAMPTZ,
+        notes TEXT,
+        created_by UUID REFERENCES users(id),
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(employee_id, month, year)
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_payroll_employee ON payroll_records(employee_id)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_payroll_period ON payroll_records(year, month)
+    `);
     console.log('🔧 schema check ok');
   } catch (e) {
     console.error('⚠️  schema check failed:', e.message);
