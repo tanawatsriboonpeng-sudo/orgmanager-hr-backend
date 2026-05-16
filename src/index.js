@@ -7,9 +7,31 @@ const rateLimit = require('express-rate-limit');
 const path = require('path');
 
 const routes = require('./routes');
+const { pool } = require('../config/database');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Self-healing schema migrations. Each statement is idempotent
+// (IF NOT EXISTS / IF EXISTS) so this is safe to run on every boot
+// and keeps deployed environments in sync without a manual step.
+async function ensureSchema() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      ALTER TABLE employees
+      ADD COLUMN IF NOT EXISTS manager_id UUID REFERENCES employees(id) ON DELETE SET NULL
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_employees_manager ON employees(manager_id)
+    `);
+    console.log('🔧 schema check ok (manager_id ensured)');
+  } catch (e) {
+    console.error('⚠️  schema check failed:', e.message);
+  } finally {
+    client.release();
+  }
+}
 
 app.use(helmet());
 app.use(cors({
@@ -40,8 +62,9 @@ app.use((err, req, res, next) => {
   res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดภายในระบบ' });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`🚀 OrgManager HR API - Port: ${PORT}`);
+  await ensureSchema();
 });
 
 module.exports = app;
