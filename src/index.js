@@ -133,7 +133,10 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20 });
+// Loosened from 20→100 so legitimate users aren't locked out after a few
+// typos plus a forgot-password attempt. Brute-force is still mitigated by
+// the per-account failed_login_count lockout in the auth controller.
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
 const generalLimiter = rateLimit({ windowMs: 1 * 60 * 1000, max: 200 });
 
 app.use(express.json({ limit: '10mb' }));
