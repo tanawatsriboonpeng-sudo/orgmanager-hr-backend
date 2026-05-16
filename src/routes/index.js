@@ -78,7 +78,9 @@ router.post('/ot/request', authenticate, async (req, res) => {
 
 // Owner included as failsafe approver for companies without dedicated HR
 // (mirrors the /leave approval setup).
-router.patch('/ot/:id/approve', authenticate, authorize('hr', 'owner'), async (req, res) => {
+router.patch('/ot/:id/approve', authenticate, authorize('hr', 'owner'),
+  auditLog('ot_approval', 'ot_requests'),
+  async (req, res) => {
   try {
     const { action, rejectedReason } = req.body;
     if (action !== 'approved' && action !== 'rejected') {
@@ -330,7 +332,9 @@ router.get('/positions', authenticate, async (req, res) => {
   }
 });
 
-router.post('/positions', authenticate, authorize('hr', 'owner'), async (req, res) => {
+router.post('/positions', authenticate, authorize('hr', 'owner'),
+  auditLog('position_create', 'positions'),
+  async (req, res) => {
   const { code, name, description, parentId } = req.body;
   if (!name || !name.trim()) {
     return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อตำแหน่ง' });
@@ -357,7 +361,9 @@ router.post('/positions', authenticate, authorize('hr', 'owner'), async (req, re
   }
 });
 
-router.patch('/positions/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
+router.patch('/positions/:id', authenticate, authorize('hr', 'owner'),
+  auditLog('position_update', 'positions'),
+  async (req, res) => {
   const { code, name, description, parentId } = req.body;
   // Prevent assigning self as parent
   if (parentId === req.params.id) {
@@ -382,7 +388,9 @@ router.patch('/positions/:id', authenticate, authorize('hr', 'owner'), async (re
   }
 });
 
-router.delete('/positions/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
+router.delete('/positions/:id', authenticate, authorize('hr', 'owner'),
+  auditLog('position_delete', 'positions'),
+  async (req, res) => {
   try {
     // Block delete if it has children
     const kids = await query('SELECT COUNT(*)::int as n FROM positions WHERE parent_id = $1', [req.params.id]);
@@ -618,7 +626,9 @@ router.get('/departments', authenticate, async (req, res) => {
   }
 });
 
-router.post('/departments', authenticate, authorize('hr', 'owner'), async (req, res) => {
+router.post('/departments', authenticate, authorize('hr', 'owner'),
+  auditLog('department_create', 'departments'),
+  async (req, res) => {
   const { name, description, managerId } = req.body;
   if (!name || !name.trim()) {
     return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อแผนก' });
@@ -636,7 +646,9 @@ router.post('/departments', authenticate, authorize('hr', 'owner'), async (req, 
   }
 });
 
-router.patch('/departments/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
+router.patch('/departments/:id', authenticate, authorize('hr', 'owner'),
+  auditLog('department_update', 'departments'),
+  async (req, res) => {
   const { name, description, managerId } = req.body;
   try {
     await query(
@@ -654,7 +666,9 @@ router.patch('/departments/:id', authenticate, authorize('hr', 'owner'), async (
   }
 });
 
-router.delete('/departments/:id', authenticate, authorize('owner'), async (req, res) => {
+router.delete('/departments/:id', authenticate, authorize('owner'),
+  auditLog('department_delete', 'departments'),
+  async (req, res) => {
   try {
     const inUse = await query(
       'SELECT COUNT(*)::int as count FROM employees WHERE department_id = $1 AND is_active = true',
@@ -867,7 +881,9 @@ router.get('/health', (req, res) => {
   res.json({ success: true, message: 'OrgManager HR API is running', version: '1.0.0', timestamp: new Date().toISOString() });
 });
 // ====== EMPLOYEE MANAGEMENT ======
-router.post('/employees/create', authenticate, authorize('hr','owner'), async (req,res) => {
+router.post('/employees/create', authenticate, authorize('hr','owner'),
+  auditLog('employee_create', 'employees'),
+  async (req,res) => {
   const {firstName,lastName,email,employeeId,position,positionId,department,role,shiftType,baseSalary,password} = req.body
   if (!firstName||!lastName||!email||!employeeId||!password)
     return res.status(400).json({success:false,message:'กรุณากรอกข้อมูลให้ครบ'})
@@ -897,7 +913,9 @@ router.post('/employees/create', authenticate, authorize('hr','owner'), async (r
   }
 })
 
-router.patch('/employees/:id', authenticate, authorize('hr','owner'), async (req,res) => {
+router.patch('/employees/:id', authenticate, authorize('hr','owner'),
+  auditLog('employee_update', 'employees'),
+  async (req,res) => {
   const {
     firstName, lastName, nickname, phone,
     position, positionId, department, shiftType, baseSalary, role,
@@ -1123,7 +1141,9 @@ router.post('/employees/work-days/bulk', authenticate, authorize('hr','owner'), 
   }
 })
 
-router.patch('/employees/:id/toggle-active', authenticate, authorize('owner'), async (req,res) => {
+router.patch('/employees/:id/toggle-active', authenticate, authorize('owner'),
+  auditLog('employee_toggle_active', 'employees'),
+  async (req,res) => {
   try {
     const e = await query('SELECT user_id,is_active FROM employees WHERE id=$1',[req.params.id])
     if(!e.rows[0]) return res.status(404).json({success:false,message:'ไม่พบพนักงาน'})
@@ -1134,7 +1154,9 @@ router.patch('/employees/:id/toggle-active', authenticate, authorize('owner'), a
   } catch(err){res.status(500).json({success:false,message:'เกิดข้อผิดพลาด'})}
 })
 
-router.patch('/employees/:id/reset-password', authenticate, authorize('hr','owner'), async (req,res) => {
+router.patch('/employees/:id/reset-password', authenticate, authorize('hr','owner'),
+  auditLog('employee_password_reset', 'users'),
+  async (req,res) => {
   const {newPassword} = req.body
   if(!newPassword||newPassword.length<6)
     return res.status(400).json({success:false,message:'รหัสผ่านต้องมีอย่างน้อย 6 ตัว'})
@@ -1159,7 +1181,9 @@ router.get('/org-settings', authenticate, async (req, res) => {
   }
 });
 
-router.patch('/org-settings', authenticate, authorize('owner'), async (req, res) => {
+router.patch('/org-settings', authenticate, authorize('owner'),
+  auditLog('org_settings_update', 'org_settings'),
+  async (req, res) => {
   const {
     companyName, companyNameEn, companyAddress,
     companyPhone, companyEmail, companyTaxId, companyLogo,
