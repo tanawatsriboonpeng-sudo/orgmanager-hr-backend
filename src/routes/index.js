@@ -33,8 +33,11 @@ router.get('/leave/types', authenticate, leaveCtrl.getLeaveTypes);
 router.get('/leave/my-quota', authenticate, leaveCtrl.getMyQuota);
 router.get('/leave/my-history', authenticate, leaveCtrl.getMyHistory);
 router.post('/leave/request', authenticate, leaveCtrl.createRequest);
+router.post('/leave/:id/cancel', authenticate, leaveCtrl.cancelRequest);
 router.get('/leave/pending', authenticate, authorize('hr', 'owner'), leaveCtrl.getPending);
-router.patch('/leave/:id/approve', authenticate, authorize('hr'), auditLog('leave_approval', 'leave_requests'), leaveCtrl.approveRequest);
+// Owner included for the single-owner-no-HR case; if the company has HR
+// staff they'll usually approve, but owner is the failsafe approver.
+router.patch('/leave/:id/approve', authenticate, authorize('hr', 'owner'), auditLog('leave_approval', 'leave_requests'), leaveCtrl.approveRequest);
 
 // ====== OT ======
 router.get('/ot/pending', authenticate, authorize('hr', 'owner'), async (req, res) => {

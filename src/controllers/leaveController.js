@@ -183,10 +183,17 @@ const getMyHistory = async (req, res) => {
     const empResult = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
     if (!empResult.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลพนักงาน' });
 
+    // Join approver via users → employees so the UI can show "อนุมัติโดย X"
+    // and surface any rejection note the HR/owner left.
     const result = await query(
-      `SELECT lr.*, lt.name as leave_type_name
+      `SELECT lr.*, lt.name as leave_type_name,
+              approver_emp.first_name AS approver_first_name,
+              approver_emp.last_name  AS approver_last_name,
+              approver_emp.nickname   AS approver_nickname
        FROM leave_requests lr
        JOIN leave_types lt ON lr.leave_type_id = lt.id
+       LEFT JOIN users approver_u ON lr.approved_by = approver_u.id
+       LEFT JOIN employees approver_emp ON approver_emp.user_id = approver_u.id
        WHERE lr.employee_id = $1
        ORDER BY lr.created_at DESC LIMIT 50`,
       [empResult.rows[0].id]
@@ -197,4 +204,35 @@ const getMyHistory = async (req, res) => {
   }
 };
 
-module.exports = { getLeaveTypes, getMyQuota, createRequest, getPending, approveRequest, getMyHistory };
+// POST /api/leave/:id/cancel
+// Employee can cancel their own request — but only while still pending.
+// Once approved, the quota has been deducted and attendance_logs marked,
+// so we don't allow self-cancel (HR has to handle that case manually).
+const cancelRequest = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const empResult = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
+    if (!empResult.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลพนักงาน' });
+
+    const leaveResult = await query('SELECT * FROM leave_requests WHERE id = $1', [id]);
+    if (!leaveResult.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบคำขอ' });
+    const leave = leaveResult.rows[0];
+
+    if (leave.employee_id !== empResult.rows[0].id) {
+      return res.status(403).json({ success: false, message: 'ยกเลิกได้เฉพาะคำขอของตัวเอง' });
+    }
+    if (leave.status !== 'pending') {
+      return res.status(400).json({ success: false, message: 'ยกเลิกได้เฉพาะคำขอที่ยังรออนุมัติ' });
+    }
+
+    await query(
+      `UPDATE leave_requests SET status = 'cancelled', updated_at = NOW() WHERE id = $1`,
+      [id]
+    );
+    res.json({ success: true, message: 'ยกเลิกคำขอลาแล้ว' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
+module.exports = { getLeaveTypes, getMyQuota, createRequest, getPending, approveRequest, getMyHistory, cancelRequest };
