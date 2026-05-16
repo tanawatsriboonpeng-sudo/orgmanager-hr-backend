@@ -4,7 +4,7 @@ const { authenticate, authorize, auditLog } = require('../middleware/auth');
 const authCtrl = require('../controllers/authController');
 const attendCtrl = require('../controllers/attendanceController');
 const leaveCtrl = require('../controllers/leaveController');
-const { query } = require('../../config/database');
+const { query, pool } = require('../../config/database');
 
 // ====== AUTH ======
 router.post('/auth/login', authCtrl.login);
@@ -741,6 +741,7 @@ router.patch('/employees/:id', authenticate, authorize('hr','owner'), async (req
     managerId, avatarUrl,
     bankAccount, bankName, nationalId,
     workDays,
+    employeeId,   // optional rename of the human-facing code (EMP-001 etc.)
     // Personal
     title, firstNameEn, lastNameEn, nicknameEn,
     gender, nationality, maritalStatus, dateOfBirth, address,
@@ -758,12 +759,51 @@ router.patch('/employees/:id', authenticate, authorize('hr','owner'), async (req
   if (avatarUrl && typeof avatarUrl === 'string' && avatarUrl.length > 700 * 1024) {
     return res.status(413).json({ success: false, message: 'รูปภาพใหญ่เกินไป (สูงสุด ~500KB)' });
   }
+  // Employee-code rename validation (separate path because it touches two
+  // tables and has its own uniqueness constraint).
+  let renameTo = null
+  if (employeeId !== undefined && employeeId !== null) {
+    const trimmed = String(employeeId).trim()
+    if (!trimmed) {
+      return res.status(400).json({ success: false, message: 'รหัสพนักงานห้ามว่าง' })
+    }
+    if (trimmed.length > 20) {
+      return res.status(400).json({ success: false, message: 'รหัสพนักงานยาวเกินไป (สูงสุด 20 ตัว)' })
+    }
+    renameTo = trimmed
+  }
   try {
     // Resolve department by name → id (department arrives as name from UI)
     let deptId = null
     if (department !== undefined && department !== null) {
       const deptRes = await query('SELECT id FROM departments WHERE name=$1', [department])
       deptId = deptRes.rows[0]?.id || null
+    }
+
+    // Employee-code rename: needs to update both employees.employee_id and
+    // users.employee_id (legacy duplicate column). Wrap in a transaction so
+    // a unique-violation on either side rolls back cleanly.
+    if (renameTo !== null) {
+      const cur = await query('SELECT employee_id, user_id FROM employees WHERE id=$1', [req.params.id])
+      const row = cur.rows[0]
+      if (!row) return res.status(404).json({ success: false, message: 'ไม่พบพนักงาน' })
+      if (row.employee_id !== renameTo) {
+        const client = await pool.connect()
+        try {
+          await client.query('BEGIN')
+          await client.query('UPDATE employees SET employee_id=$1, updated_at=NOW() WHERE id=$2', [renameTo, req.params.id])
+          if (row.user_id) {
+            await client.query('UPDATE users SET employee_id=$1 WHERE id=$2', [renameTo, row.user_id])
+          }
+          await client.query('COMMIT')
+        } catch (e) {
+          await client.query('ROLLBACK').catch(() => {})
+          if (e.code === '23505') {
+            return res.status(409).json({ success: false, message: 'รหัสพนักงานนี้มีคนอื่นใช้แล้ว' })
+          }
+          throw e
+        } finally { client.release() }
+      }
     }
 
     // Prevent setting manager_id to self (would create a self-loop)
