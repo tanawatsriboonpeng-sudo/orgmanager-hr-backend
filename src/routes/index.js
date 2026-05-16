@@ -1451,6 +1451,450 @@ router.post('/payroll/bulk-generate', authenticate, authorize('hr', 'owner'),
   }
 });
 
+// ====== KPI ======
+// Two tables back this:
+//   kpi_criteria — rubric items (name, weight, optional department scope).
+//                  Weight is relative; computeOverall() divides by the sum
+//                  of weights actually used so absolute scale doesn't matter.
+//   kpi_reviews  — one row per (employee, quarter, year). scores is JSONB:
+//                  [ { criterionId, score:1-5, note? } ]. overall_score is
+//                  0-100, computed server-side as weighted_avg(score) × 20.
+// Status flow: draft (reviewer drafting) → submitted (locked, visible to
+// subject) → approved (HR endorsed). Employees only see submitted/approved
+// reviews of themselves — drafts stay private to the reviewer.
+
+// "Am I this employee's manager?" Map req.user.id (users.id) → employees.id
+// then check that against target.manager_id.
+async function isManagerOf(reqUserId, targetEmployeeId) {
+  const r = await query(
+    `SELECT 1 FROM employees target
+       JOIN employees mgr ON target.manager_id = mgr.id
+       WHERE target.id = $1 AND mgr.user_id = $2`,
+    [targetEmployeeId, reqUserId]
+  );
+  return r.rowCount > 0;
+}
+
+function computeOverall(scores, weightById) {
+  let weightedSum = 0;
+  let weightTotal = 0;
+  for (const s of scores) {
+    const w = Number(weightById[s.criterionId] ?? 0);
+    if (!w) continue;
+    weightedSum += w * Number(s.score);
+    weightTotal += w;
+  }
+  if (!weightTotal) return 0;
+  // 1-5 weighted average × 20 → 0-100, rounded to 2dp.
+  return Math.round((weightedSum / weightTotal) * 20 * 100) / 100;
+}
+
+// ----- Criteria -----
+
+// GET /kpi/criteria — list. Anyone authenticated. By default only active
+// criteria are returned (used by the review editor); HR/owner can pass
+// ?includeInactive=1 to also see soft-deleted rows for management.
+router.get('/kpi/criteria', authenticate, async (req, res) => {
+  try {
+    const includeInactive = req.query.includeInactive === '1'
+      && (req.user.role === 'hr' || req.user.role === 'owner');
+    const r = await query(
+      `SELECT c.id, c.name, c.description, c.weight, c.department_id,
+              c.is_active, c.created_at, d.name AS department_name
+         FROM kpi_criteria c
+         LEFT JOIN departments d ON c.department_id = d.id
+         ${includeInactive ? '' : 'WHERE c.is_active = true'}
+         ORDER BY c.is_active DESC, c.created_at ASC`
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (e) {
+    console.error('GET /kpi/criteria error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.post('/kpi/criteria', authenticate, authorize('hr', 'owner'), async (req, res) => {
+  const { name, description, weight, departmentId } = req.body;
+  if (!name || !name.trim()) {
+    return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อเกณฑ์' });
+  }
+  const w = weight === undefined || weight === null || weight === '' ? 100 : Number(weight);
+  if (!Number.isFinite(w) || w <= 0) {
+    return res.status(400).json({ success: false, message: 'น้ำหนักต้องเป็นตัวเลขมากกว่า 0' });
+  }
+  try {
+    const r = await query(
+      `INSERT INTO kpi_criteria (name, description, weight, department_id)
+         VALUES ($1, $2, $3, $4) RETURNING *`,
+      [name.trim(), description || null, w, departmentId || null]
+    );
+    res.status(201).json({ success: true, message: 'เพิ่มเกณฑ์แล้ว', data: r.rows[0] });
+  } catch (err) {
+    console.error('POST /kpi/criteria error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.patch('/kpi/criteria/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
+  const { name, description, weight, departmentId, isActive } = req.body;
+  if (weight !== undefined && weight !== null) {
+    const w = Number(weight);
+    if (!Number.isFinite(w) || w <= 0) {
+      return res.status(400).json({ success: false, message: 'น้ำหนักต้องเป็นตัวเลขมากกว่า 0' });
+    }
+  }
+  try {
+    const r = await query(
+      `UPDATE kpi_criteria SET
+         name          = COALESCE($1, name),
+         description   = COALESCE($2, description),
+         weight        = COALESCE($3, weight),
+         department_id = CASE WHEN $4::text = '__clear__' THEN NULL
+                              WHEN $4 IS NULL THEN department_id
+                              ELSE $4::uuid END,
+         is_active     = COALESCE($5, is_active)
+       WHERE id = $6 RETURNING *`,
+      [
+        name?.trim() || null,
+        description ?? null,
+        weight ?? null,
+        departmentId === null ? '__clear__' : (departmentId ?? null),
+        isActive ?? null,
+        req.params.id,
+      ]
+    );
+    if (!r.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบเกณฑ์' });
+    res.json({ success: true, message: 'อัปเดตเกณฑ์แล้ว', data: r.rows[0] });
+  } catch (err) {
+    console.error('PATCH /kpi/criteria/:id error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// DELETE /kpi/criteria/:id — hard delete only if no review references it;
+// otherwise soft-delete (is_active=false) so historical reviews still
+// show the criterion name. Soft-deleted criteria are hidden from the
+// review editor but visible to HR via ?includeInactive=1.
+router.delete('/kpi/criteria/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
+  try {
+    const usage = await query(
+      `SELECT 1 FROM kpi_reviews
+        WHERE scores @> $1::jsonb LIMIT 1`,
+      [JSON.stringify([{ criterionId: req.params.id }])]
+    );
+    if (usage.rowCount > 0) {
+      await query(`UPDATE kpi_criteria SET is_active = false WHERE id = $1`, [req.params.id]);
+      return res.json({ success: true, message: 'ปิดใช้งานเกณฑ์แล้ว (มีการประเมินอ้างอิงอยู่)' });
+    }
+    const r = await query(`DELETE FROM kpi_criteria WHERE id = $1 RETURNING id`, [req.params.id]);
+    if (!r.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบเกณฑ์' });
+    res.json({ success: true, message: 'ลบเกณฑ์แล้ว' });
+  } catch (err) {
+    console.error('DELETE /kpi/criteria/:id error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// ----- Reviews -----
+
+// GET /kpi/reviews — visibility:
+//   hr/owner: every row
+//   employee with subordinates: rows where they are the reviewer OR the
+//                               subject's manager — plus their own
+//                               submitted/approved reviews
+//   plain employee: own submitted/approved only (drafts stay private to
+//                   the reviewer until submit).
+// Filters: employeeId, quarter, year, status.
+router.get('/kpi/reviews', authenticate, async (req, res) => {
+  const { employeeId, quarter, year, status } = req.query;
+  try {
+    const where = [];
+    const params = [];
+    const push = (clause, value) => { params.push(value); where.push(clause.replace('$$', `$${params.length}`)); };
+
+    const isHR = req.user.role === 'hr' || req.user.role === 'owner';
+    if (!isHR) {
+      const r = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
+      const selfEmpId = r.rows[0]?.id || null;
+      if (!selfEmpId) return res.json({ success: true, data: [] });
+      // Self sees: their own submitted/approved + anything where they're
+      // the reviewer + subordinates' reviews (any status).
+      params.push(selfEmpId, req.user.id, selfEmpId);
+      const a = params.length - 2, b = params.length - 1, c = params.length;
+      where.push(
+        `((r.employee_id = $${a} AND r.status IN ('submitted','approved'))
+           OR r.reviewer_id = $${b}
+           OR e.manager_id = $${c})`
+      );
+    }
+    if (employeeId) push('r.employee_id = $$', employeeId);
+    if (quarter)    push('r.quarter = $$',     parseInt(quarter, 10));
+    if (year)       push('r.year = $$',        parseInt(year, 10));
+    if (status)     push('r.status = $$',      status);
+
+    const sql = `
+      SELECT r.*,
+             e.first_name, e.last_name, e.nickname, e.avatar_url,
+             e.employee_id AS emp_code, e.position,
+             d.name AS department_name,
+             ru.email AS reviewer_email,
+             re.first_name AS reviewer_first_name,
+             re.last_name  AS reviewer_last_name,
+             re.nickname   AS reviewer_nickname,
+             re.avatar_url AS reviewer_avatar_url
+        FROM kpi_reviews r
+        JOIN employees e ON r.employee_id = e.id
+        LEFT JOIN departments d ON e.department_id = d.id
+        LEFT JOIN users ru     ON r.reviewer_id = ru.id
+        LEFT JOIN employees re ON re.user_id   = ru.id
+        ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+       ORDER BY r.year DESC, r.quarter DESC, r.created_at DESC`;
+    const r = await query(sql, params);
+    res.json({ success: true, data: r.rows });
+  } catch (e) {
+    console.error('GET /kpi/reviews error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// GET /kpi/reviews/:id — same visibility rules as list. Joins criteria
+// names onto each score entry so the UI can render without a second fetch
+// (works for soft-deleted criteria too — they stay readable in history).
+router.get('/kpi/reviews/:id', authenticate, async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT r.*,
+              e.first_name, e.last_name, e.nickname, e.avatar_url,
+              e.employee_id AS emp_code, e.position, e.manager_id,
+              d.name AS department_name,
+              ru.email AS reviewer_email,
+              re.first_name AS reviewer_first_name,
+              re.last_name  AS reviewer_last_name,
+              re.nickname   AS reviewer_nickname,
+              re.avatar_url AS reviewer_avatar_url
+         FROM kpi_reviews r
+         JOIN employees e ON r.employee_id = e.id
+         LEFT JOIN departments d ON e.department_id = d.id
+         LEFT JOIN users ru     ON r.reviewer_id = ru.id
+         LEFT JOIN employees re ON re.user_id   = ru.id
+        WHERE r.id = $1`,
+      [req.params.id]
+    );
+    const row = r.rows[0];
+    if (!row) return res.status(404).json({ success: false, message: 'ไม่พบการประเมิน' });
+
+    const isHR = req.user.role === 'hr' || req.user.role === 'owner';
+    if (!isHR) {
+      const selfEmp = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
+      const selfEmpId = selfEmp.rows[0]?.id || null;
+      const isReviewer = row.reviewer_id === req.user.id;
+      const isSubject = row.employee_id === selfEmpId;
+      const isMgr = row.manager_id === selfEmpId;
+      if (!isReviewer && !isMgr && !(isSubject && (row.status === 'submitted' || row.status === 'approved'))) {
+        return res.status(403).json({ success: false, message: 'ไม่มีสิทธิ์ดูการประเมินนี้' });
+      }
+    }
+
+    // Enrich score entries with criterion name/weight for display.
+    const ids = (row.scores || []).map(s => s.criterionId).filter(Boolean);
+    if (ids.length) {
+      const cr = await query(
+        `SELECT id, name, weight, is_active FROM kpi_criteria WHERE id = ANY($1::uuid[])`,
+        [ids]
+      );
+      const byId = Object.fromEntries(cr.rows.map(c => [c.id, c]));
+      row.scores = row.scores.map(s => ({
+        ...s,
+        criterion_name: byId[s.criterionId]?.name || '(เกณฑ์ถูกลบ)',
+        criterion_weight: byId[s.criterionId]?.weight ?? null,
+        criterion_active: byId[s.criterionId]?.is_active ?? false,
+      }));
+    }
+    res.json({ success: true, data: row });
+  } catch (e) {
+    console.error('GET /kpi/reviews/:id error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// POST /kpi/reviews — reviewer must be the subject's manager (or HR/owner
+// override). Body: { employeeId, quarter, year, scores:[{criterionId,score,note?}], comments? }
+router.post('/kpi/reviews', authenticate, async (req, res) => {
+  const { employeeId, quarter, year, scores, comments } = req.body;
+  if (!employeeId || !quarter || !year) {
+    return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบ (employeeId, quarter, year จำเป็น)' });
+  }
+  const q = parseInt(quarter, 10), y = parseInt(year, 10);
+  if (![1, 2, 3, 4].includes(q)) return res.status(400).json({ success: false, message: 'quarter ต้องเป็น 1-4' });
+  if (!Number.isFinite(y) || y < 2000 || y > 2100) return res.status(400).json({ success: false, message: 'year ไม่ถูกต้อง' });
+
+  const isHR = req.user.role === 'hr' || req.user.role === 'owner';
+  if (!isHR && !(await isManagerOf(req.user.id, employeeId))) {
+    return res.status(403).json({ success: false, message: 'เฉพาะหัวหน้าของพนักงานคนนี้เท่านั้นที่ประเมินได้' });
+  }
+
+  const cleanScores = Array.isArray(scores) ? scores : [];
+  for (const s of cleanScores) {
+    const sc = Number(s?.score);
+    if (!s?.criterionId || !Number.isFinite(sc) || sc < 1 || sc > 5) {
+      return res.status(400).json({ success: false, message: 'คะแนนต้องเป็น 1-5 และต้องระบุเกณฑ์' });
+    }
+  }
+  try {
+    let overall = 0;
+    if (cleanScores.length) {
+      const cr = await query(
+        `SELECT id, weight FROM kpi_criteria WHERE id = ANY($1::uuid[])`,
+        [cleanScores.map(s => s.criterionId)]
+      );
+      const weightById = Object.fromEntries(cr.rows.map(r => [r.id, r.weight]));
+      overall = computeOverall(cleanScores, weightById);
+    }
+    const r = await query(
+      `INSERT INTO kpi_reviews (employee_id, reviewer_id, quarter, year, scores, overall_score, comments)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7) RETURNING *`,
+      [employeeId, req.user.id, q, y, JSON.stringify(cleanScores), overall, comments || null]
+    );
+    res.status(201).json({ success: true, message: 'สร้างการประเมินแล้ว', data: r.rows[0] });
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ success: false, message: 'มีการประเมินของพนักงานคนนี้สำหรับไตรมาส/ปีนี้แล้ว' });
+    }
+    console.error('POST /kpi/reviews error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// PATCH /kpi/reviews/:id — reviewer (while draft) or hr/owner (any time
+// before paid-equivalent — here we just allow hr/owner to edit any status).
+// Body: { scores?, comments?, status? } — status updates beyond draft go
+// through the dedicated /submit and /approve endpoints to keep the flow
+// explicit, but we accept "draft" here to reopen a submitted review.
+router.patch('/kpi/reviews/:id', authenticate, async (req, res) => {
+  const { scores, comments, status } = req.body;
+  try {
+    const existing = await query(
+      `SELECT id, employee_id, reviewer_id, status FROM kpi_reviews WHERE id = $1`,
+      [req.params.id]
+    );
+    const row = existing.rows[0];
+    if (!row) return res.status(404).json({ success: false, message: 'ไม่พบการประเมิน' });
+
+    const isHR = req.user.role === 'hr' || req.user.role === 'owner';
+    const isReviewer = row.reviewer_id === req.user.id;
+    if (!isHR && !isReviewer) {
+      return res.status(403).json({ success: false, message: 'ไม่มีสิทธิ์แก้ไข' });
+    }
+    if (!isHR && row.status !== 'draft') {
+      return res.status(400).json({ success: false, message: 'แก้ไขได้เฉพาะการประเมินที่เป็น "ร่าง"' });
+    }
+    if (status && !['draft','submitted','approved'].includes(status)) {
+      return res.status(400).json({ success: false, message: 'สถานะไม่ถูกต้อง' });
+    }
+    // Only hr/owner can move to/from submitted/approved via this endpoint —
+    // reviewers should use /submit instead. Allow reviewer to keep status as draft.
+    if (status && status !== 'draft' && !isHR) {
+      return res.status(403).json({ success: false, message: 'ใช้ปุ่ม "ส่งการประเมิน" หรือ "อนุมัติ" แทน' });
+    }
+
+    let cleanScores = null;
+    let overall = null;
+    if (Array.isArray(scores)) {
+      for (const s of scores) {
+        const sc = Number(s?.score);
+        if (!s?.criterionId || !Number.isFinite(sc) || sc < 1 || sc > 5) {
+          return res.status(400).json({ success: false, message: 'คะแนนต้องเป็น 1-5 และต้องระบุเกณฑ์' });
+        }
+      }
+      cleanScores = scores;
+      const cr = await query(
+        `SELECT id, weight FROM kpi_criteria WHERE id = ANY($1::uuid[])`,
+        [cleanScores.map(s => s.criterionId)]
+      );
+      const weightById = Object.fromEntries(cr.rows.map(r => [r.id, r.weight]));
+      overall = computeOverall(cleanScores, weightById);
+    }
+
+    await query(
+      `UPDATE kpi_reviews SET
+         scores        = COALESCE($1::jsonb, scores),
+         overall_score = COALESCE($2, overall_score),
+         comments      = COALESCE($3, comments),
+         status        = COALESCE($4, status),
+         updated_at    = NOW()
+       WHERE id = $5`,
+      [
+        cleanScores ? JSON.stringify(cleanScores) : null,
+        overall,
+        comments ?? null,
+        status ?? null,
+        req.params.id,
+      ]
+    );
+    res.json({ success: true, message: 'อัปเดตการประเมินแล้ว' });
+  } catch (err) {
+    console.error('PATCH /kpi/reviews/:id error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// POST /kpi/reviews/:id/submit — reviewer locks in their draft. From here
+// the subject can see it.
+router.post('/kpi/reviews/:id/submit', authenticate, async (req, res) => {
+  try {
+    const existing = await query(
+      `SELECT reviewer_id, status FROM kpi_reviews WHERE id = $1`,
+      [req.params.id]
+    );
+    const row = existing.rows[0];
+    if (!row) return res.status(404).json({ success: false, message: 'ไม่พบการประเมิน' });
+    const isHR = req.user.role === 'hr' || req.user.role === 'owner';
+    if (!isHR && row.reviewer_id !== req.user.id) {
+      return res.status(403).json({ success: false, message: 'เฉพาะผู้ประเมินเท่านั้นที่ส่งการประเมินได้' });
+    }
+    if (row.status !== 'draft') {
+      return res.status(400).json({ success: false, message: 'ส่งได้เฉพาะการประเมินที่เป็น "ร่าง"' });
+    }
+    await query(`UPDATE kpi_reviews SET status='submitted', updated_at=NOW() WHERE id=$1`, [req.params.id]);
+    res.json({ success: true, message: 'ส่งการประเมินแล้ว' });
+  } catch (err) {
+    console.error('POST /kpi/reviews/:id/submit error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.post('/kpi/reviews/:id/approve', authenticate, authorize('hr', 'owner'),
+  auditLog('kpi_approve', 'kpi_reviews'),
+  async (req, res) => {
+  try {
+    const r = await query(
+      `UPDATE kpi_reviews SET status='approved', updated_at=NOW()
+         WHERE id=$1 AND status='submitted' RETURNING id`,
+      [req.params.id]
+    );
+    if (!r.rows[0]) return res.status(400).json({ success: false, message: 'อนุมัติได้เฉพาะการประเมินที่ส่งแล้ว' });
+    res.json({ success: true, message: 'อนุมัติการประเมินแล้ว' });
+  } catch (err) {
+    console.error('POST /kpi/reviews/:id/approve error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.delete('/kpi/reviews/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
+  try {
+    const existing = await query(`SELECT status FROM kpi_reviews WHERE id = $1`, [req.params.id]);
+    if (!existing.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบการประเมิน' });
+    if (existing.rows[0].status !== 'draft') {
+      return res.status(400).json({ success: false, message: 'ลบได้เฉพาะการประเมินที่เป็น "ร่าง"' });
+    }
+    await query(`DELETE FROM kpi_reviews WHERE id = $1`, [req.params.id]);
+    res.json({ success: true, message: 'ลบการประเมินแล้ว' });
+  } catch (err) {
+    console.error('DELETE /kpi/reviews/:id error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
 // ====== FORGOT PASSWORD / OTP ======
 const { sendOTPEmail } = require('../services/emailService')
 const crypto = require('crypto')

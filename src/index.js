@@ -259,6 +259,43 @@ async function ensureSchema() {
     await client.query(`
       INSERT INTO org_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING
     `);
+    // KPI tables — defensive in case prod DB predates migrate.js.
+    // criteria: weighted rubric items. weight is a relative number (no need
+    // to sum to 100); the review-overall formula divides by the sum of the
+    // weights actually used so it stays correct regardless.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS kpi_criteria (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(200) NOT NULL,
+        description TEXT,
+        weight NUMERIC(5,2) DEFAULT 100,
+        department_id UUID REFERENCES departments(id),
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    // reviews: one per (employee, quarter, year). scores is a JSONB array of
+    // { criterionId, score (1-5), note? }. overall_score is 0-100, computed
+    // server-side as weighted_avg(score) × 20.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS kpi_reviews (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        employee_id UUID REFERENCES employees(id) ON DELETE CASCADE,
+        reviewer_id UUID REFERENCES users(id),
+        quarter INT NOT NULL CHECK (quarter IN (1,2,3,4)),
+        year INT NOT NULL,
+        scores JSONB NOT NULL DEFAULT '[]',
+        overall_score NUMERIC(5,2),
+        status VARCHAR(20) DEFAULT 'draft' CHECK (status IN ('draft','submitted','approved')),
+        comments TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(employee_id, quarter, year)
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_kpi_reviews_employee ON kpi_reviews(employee_id, year DESC, quarter DESC)
+    `);
     console.log('🔧 schema check ok');
   } catch (e) {
     console.error('⚠️  schema check failed:', e.message);
