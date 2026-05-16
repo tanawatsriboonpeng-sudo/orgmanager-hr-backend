@@ -868,7 +868,7 @@ router.get('/health', (req, res) => {
 });
 // ====== EMPLOYEE MANAGEMENT ======
 router.post('/employees/create', authenticate, authorize('hr','owner'), async (req,res) => {
-  const {firstName,lastName,email,employeeId,position,department,role,shiftType,baseSalary,password} = req.body
+  const {firstName,lastName,email,employeeId,position,positionId,department,role,shiftType,baseSalary,password} = req.body
   if (!firstName||!lastName||!email||!employeeId||!password)
     return res.status(400).json({success:false,message:'กรุณากรอกข้อมูลให้ครบ'})
   try {
@@ -876,8 +876,20 @@ router.post('/employees/create', authenticate, authorize('hr','owner'), async (r
     const hash = await bcrypt.hash(password,12)
     const deptRes = await query('SELECT id FROM departments WHERE name=$1',[department])
     const deptId = deptRes.rows[0]?.id||null
+    // positionId wins over the freeform position string — when given, we
+    // overwrite the text with the canonical position name so the two
+    // columns stay in sync. position-string-only path (no positionId) is
+    // still supported for legacy callers.
+    let finalPositionId = null
+    let finalPosition = position || null
+    if (positionId) {
+      const pRes = await query('SELECT name FROM positions WHERE id=$1', [positionId])
+      if (!pRes.rows[0]) return res.status(400).json({success:false, message:'ตำแหน่งที่เลือกไม่พบ'})
+      finalPositionId = positionId
+      finalPosition = pRes.rows[0].name
+    }
     const uRes = await query('INSERT INTO users(employee_id,email,password_hash,role) VALUES($1,$2,$3,$4) RETURNING id',[employeeId,email.toLowerCase(),hash,role||'employee'])
-    await query('INSERT INTO employees(user_id,employee_id,first_name,last_name,department_id,position,shift_type,base_salary,start_date) VALUES($1,$2,$3,$4,$5,$6,$7,$8,CURRENT_DATE)',[uRes.rows[0].id,employeeId,firstName,lastName,deptId,position,shiftType||'normal',baseSalary||0])
+    await query('INSERT INTO employees(user_id,employee_id,first_name,last_name,department_id,position,position_id,shift_type,base_salary,start_date) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,CURRENT_DATE)',[uRes.rows[0].id,employeeId,firstName,lastName,deptId,finalPosition,finalPositionId,shiftType||'normal',baseSalary||0])
     res.status(201).json({success:true,message:`สร้างบัญชี ${firstName} ${lastName} สำเร็จ`})
   } catch(err) {
     if(err.code==='23505') return res.status(400).json({success:false,message:'อีเมลหรือรหัสพนักงานซ้ำในระบบ'})
@@ -888,7 +900,7 @@ router.post('/employees/create', authenticate, authorize('hr','owner'), async (r
 router.patch('/employees/:id', authenticate, authorize('hr','owner'), async (req,res) => {
   const {
     firstName, lastName, nickname, phone,
-    position, department, shiftType, baseSalary, role,
+    position, positionId, department, shiftType, baseSalary, role,
     managerId, avatarUrl,
     bankAccount, bankName, nationalId,
     workDays,
@@ -1026,6 +1038,30 @@ router.patch('/employees/:id', authenticate, authorize('hr','owner'), async (req
        notes, Array.isArray(hashtags) ? hashtags : null,
       ]
     )
+
+    // positionId update runs as a separate statement because the legacy
+    // PATCH uses COALESCE for every field (so null = "leave alone"), but
+    // we need positionId to be settable to null when the user clears
+    // their position. Whenever positionId is explicitly present in the
+    // body we re-write both position_id and the legacy position text so
+    // they stay in sync.
+    if (positionId !== undefined) {
+      if (positionId === null || positionId === '') {
+        await query(
+          'UPDATE employees SET position_id = NULL, position = NULL, updated_at = NOW() WHERE id = $1',
+          [req.params.id]
+        )
+      } else {
+        const pRes = await query('SELECT name FROM positions WHERE id = $1', [positionId])
+        if (!pRes.rows[0]) {
+          return res.status(400).json({ success: false, message: 'ตำแหน่งที่เลือกไม่พบ' })
+        }
+        await query(
+          'UPDATE employees SET position_id = $1, position = $2, updated_at = NOW() WHERE id = $3',
+          [positionId, pRes.rows[0].name, req.params.id]
+        )
+      }
+    }
 
     // Role change is owner-only
     if (role && req.user.role === 'owner') {

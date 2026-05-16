@@ -157,6 +157,26 @@ async function ensureSchema() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_positions_parent ON positions(parent_id)
     `);
+    // Link employees to a row in the positions tree. The legacy `position`
+    // VARCHAR column stays in place — we write both in sync so existing
+    // SELECT e.position queries keep working — but position_id is the
+    // canonical reference for joins, structure navigation, and the future
+    // position-aware org chart.
+    await client.query(`
+      ALTER TABLE employees
+      ADD COLUMN IF NOT EXISTS position_id UUID REFERENCES positions(id) ON DELETE SET NULL
+    `);
+    // One-shot backfill: any employee with a position string that exactly
+    // matches a positions.name gets linked. Idempotent (only fills NULLs)
+    // so safe to run on every boot. Names not found stay text-only.
+    await client.query(`
+      UPDATE employees e
+         SET position_id = p.id
+        FROM positions p
+       WHERE e.position_id IS NULL
+         AND e.position IS NOT NULL
+         AND e.position = p.name
+    `);
     // Comprehensive HumanSoft-style employee profile fields. Mostly
     // optional — the form lets owner/HR fill them in over time and the
     // employee themselves can self-edit a safe subset.
