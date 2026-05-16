@@ -35,6 +35,27 @@ async function ensureSchema() {
       ALTER TABLE departments
       ADD COLUMN IF NOT EXISTS description TEXT
     `);
+    // Per-day shift overrides. Each row is one employee on one date.
+    // Falls back to employees.shift_type when no row exists for a given day.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS shift_assignments (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        employee_id UUID REFERENCES employees(id) ON DELETE CASCADE,
+        date DATE NOT NULL,
+        shift_type VARCHAR(20) NOT NULL CHECK (shift_type IN ('normal','flexible','dayoff')),
+        notes TEXT,
+        created_by UUID REFERENCES users(id),
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(employee_id, date)
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_shift_assignments_date ON shift_assignments(date)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_shift_assignments_employee_date ON shift_assignments(employee_id, date)
+    `);
     console.log('🔧 schema check ok');
   } catch (e) {
     console.error('⚠️  schema check failed:', e.message);

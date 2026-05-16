@@ -14,8 +14,16 @@ router.post('/auth/change-password', authenticate, authCtrl.changePassword);
 router.get('/auth/me', authenticate, authCtrl.getMe);
 
 // ====== ATTENDANCE ======
-router.post('/attendance/check-in', authenticate, attendCtrl.checkIn);
-router.post('/attendance/check-out', authenticate, attendCtrl.checkOut);
+// Owners do not check in. Block at the API layer so any client (web, mobile)
+// gets the same answer — the frontend hides the UI separately.
+const blockOwner = (req, res, next) => {
+  if (req.user?.role === 'owner') {
+    return res.status(403).json({ success: false, message: 'เจ้าของไม่ต้องลงทะเบียนเข้างาน' });
+  }
+  next();
+};
+router.post('/attendance/check-in', authenticate, blockOwner, attendCtrl.checkIn);
+router.post('/attendance/check-out', authenticate, blockOwner, attendCtrl.checkOut);
 router.get('/attendance/today', authenticate, attendCtrl.getToday);
 router.get('/attendance/my-history', authenticate, attendCtrl.getMyHistory);
 router.get('/attendance/daily-summary', authenticate, authorize('owner', 'hr'), attendCtrl.getDailySummary);
@@ -44,6 +52,9 @@ router.get('/ot/pending', authenticate, authorize('hr', 'owner'), async (req, re
 });
 
 router.post('/ot/request', authenticate, async (req, res) => {
+  if (req.user.role === 'owner') {
+    return res.status(403).json({ success: false, message: 'เจ้าของไม่ต้องขอ OT' });
+  }
   try {
     const { date, startTime, endTime, reason } = req.body;
     const empResult = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
@@ -126,6 +137,82 @@ router.patch('/employees/me', authenticate, async (req, res) => {
     res.json({ success: true, message: 'อัปเดตข้อมูลส่วนตัวแล้ว' });
   } catch (e) {
     console.error('PATCH /employees/me error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// ====== SHIFT ASSIGNMENTS ======
+// GET /api/shifts?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+// Returns one record per (employee, date) that has been explicitly assigned.
+// Missing days fall back to employees.shift_type on the frontend.
+router.get('/shifts', authenticate, authorize('hr', 'owner'), async (req, res) => {
+  const { startDate, endDate } = req.query;
+  if (!startDate || !endDate) {
+    return res.status(400).json({ success: false, message: 'กรุณาระบุ startDate และ endDate' });
+  }
+  try {
+    const r = await query(
+      `SELECT id, employee_id, date::text as date, shift_type, notes
+       FROM shift_assignments
+       WHERE date BETWEEN $1 AND $2
+       ORDER BY date, employee_id`,
+      [startDate, endDate]
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (e) {
+    console.error('GET /shifts error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// POST /api/shifts/bulk
+// Body: { items: [{ employeeId, date, shiftType }, ...] }
+// Upserts each item. shiftType 'default' deletes the override so the row
+// falls back to employees.shift_type.
+router.post('/shifts/bulk', authenticate, authorize('hr', 'owner'), async (req, res) => {
+  const { items } = req.body;
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ success: false, message: 'ไม่มีข้อมูล' });
+  }
+  const allowed = new Set(['normal', 'flexible', 'dayoff']);
+  try {
+    let upserts = 0;
+    let deletes = 0;
+    for (const it of items) {
+      if (!it.employeeId || !it.date) continue;
+      if (it.shiftType === 'default' || it.shiftType === '' || it.shiftType == null) {
+        await query(
+          'DELETE FROM shift_assignments WHERE employee_id = $1 AND date = $2',
+          [it.employeeId, it.date]
+        );
+        deletes++;
+        continue;
+      }
+      if (!allowed.has(it.shiftType)) continue;
+      await query(
+        `INSERT INTO shift_assignments (employee_id, date, shift_type, notes, created_by, updated_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())
+         ON CONFLICT (employee_id, date)
+         DO UPDATE SET shift_type = EXCLUDED.shift_type,
+                       notes = EXCLUDED.notes,
+                       updated_at = NOW()`,
+        [it.employeeId, it.date, it.shiftType, it.notes || null, req.user.id]
+      );
+      upserts++;
+    }
+    res.json({ success: true, message: `บันทึก ${upserts} รายการ`, data: { upserts, deletes } });
+  } catch (e) {
+    console.error('POST /shifts/bulk error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// DELETE /api/shifts/:id — remove a single assignment
+router.delete('/shifts/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
+  try {
+    await query('DELETE FROM shift_assignments WHERE id = $1', [req.params.id]);
+    res.json({ success: true, message: 'ลบรายการแล้ว' });
+  } catch (e) {
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
 });
