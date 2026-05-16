@@ -136,15 +136,15 @@ router.get('/departments', authenticate, async (req, res) => {
     const r = await query(
       `SELECT d.id, d.name, d.description, d.manager_id,
               CONCAT(m.first_name, ' ', m.last_name) as manager_name,
-              (SELECT COUNT(*) FROM employees e WHERE e.department_id = d.id AND e.is_active = true) as member_count
+              (SELECT COUNT(*) FROM employees e WHERE e.department_id = d.id AND e.is_active = true)::int as member_count
        FROM departments d
        LEFT JOIN employees m ON d.manager_id = m.id
        ORDER BY d.name`
     );
     res.json({ success: true, data: r.rows });
   } catch (e) {
-    console.error('GET /departments error:', e.message);
-    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+    console.error('GET /departments error:', e.message, e.stack);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด', debug: e.message });
   }
 });
 
@@ -161,8 +161,8 @@ router.post('/departments', authenticate, authorize('hr', 'owner'), async (req, 
     res.status(201).json({ success: true, message: 'สร้างแผนกแล้ว', data: r.rows[0] });
   } catch (err) {
     if (err.code === '23505') return res.status(400).json({ success: false, message: 'มีแผนกชื่อนี้อยู่แล้ว' });
-    console.error('POST /departments error:', err.message);
-    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+    console.error('POST /departments error:', err.message, err.stack);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด', debug: err.message });
   }
 });
 
