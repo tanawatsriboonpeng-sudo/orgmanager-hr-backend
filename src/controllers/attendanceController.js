@@ -6,27 +6,103 @@ const COMPANY_LAT = parseFloat(process.env.COMPANY_LAT || '13.7563');
 const COMPANY_LNG = parseFloat(process.env.COMPANY_LNG || '100.5018');
 const MAX_RADIUS = parseInt(process.env.CHECKIN_RADIUS_METERS || '60');
 
-// คำนวณสถานะ check-in
-const calcStatus = (checkInTime, shiftType) => {
-  const h = checkInTime.hour();
-  const m = checkInTime.minute();
-  const totalMin = h * 60 + m;
+// Resolve the active shift_configs row for an employee on a given date.
+// Priority:
+//   1. employees.weekly_shifts[dayOfWeek] — if it's "dayoff", short-circuit;
+//      otherwise look up the shift_configs row by code.
+//   2. Fall back to the first active shift_configs row whose shift_type
+//      matches employees.shift_type ('normal' / 'flexible').
+//   3. Return { config: null } if no config exists — caller should use
+//      built-in defaults so the system still works on a fresh install.
+async function resolveShiftConfig(empId, date) {
+  const emp = await query(
+    `SELECT id, shift_type, weekly_shifts FROM employees WHERE id = $1`,
+    [empId]
+  );
+  if (!emp.rows[0]) return { config: null, isDayOff: false };
+  const e = emp.rows[0];
+  const dow = String(dayjs(date).day());
+  const weeklyCode = e.weekly_shifts && e.weekly_shifts[dow];
 
-  if (shiftType === 'flexible') {
-    if (totalMin <= 7 * 60 + 5) return { status: 'present', detail: 'ออกงาน 15:00' };
-    if (totalMin <= 8 * 60 + 5) return { status: 'present', detail: 'ออกงาน 16:00' };
-    if (totalMin <= 9 * 60 + 5) return { status: 'present', detail: 'ออกงาน 17:00' };
-    if (totalMin <= 10 * 60 + 5) return { status: 'present', detail: 'ออกงาน 18:00' };
-    if (totalMin <= 10 * 60 + 20) return { status: 'late', detail: 'สาย (ออกงาน 18:00)' };
-    return { status: 'absent', detail: 'ขาดงาน (เกิน 10:20 น.)' };
+  if (weeklyCode === 'dayoff') {
+    return { config: null, isDayOff: true };
+  }
+  if (weeklyCode) {
+    const r = await query(
+      `SELECT * FROM shift_configs WHERE code = $1 AND is_active = true LIMIT 1`,
+      [weeklyCode]
+    );
+    if (r.rows[0]) return { config: r.rows[0], isDayOff: false };
+  }
+  const fallback = await query(
+    `SELECT * FROM shift_configs
+       WHERE shift_type = $1 AND is_active = true
+       ORDER BY created_at ASC LIMIT 1`,
+    [e.shift_type || 'normal']
+  );
+  return { config: fallback.rows[0] || null, isDayOff: false };
+}
+
+// "HH:MM[:SS]" → minutes since midnight. Tolerant of seconds suffix and
+// PG TIME values which serialize either way.
+function timeToMin(t) {
+  if (!t) return 0;
+  const parts = String(t).split(':');
+  return (parseInt(parts[0], 10) || 0) * 60 + (parseInt(parts[1], 10) || 0);
+}
+
+// Status calculation that honors the shift_configs thresholds.
+// Returns { status, detail, almostLate } where almostLate flags the
+// in-between bucket so the summaries can count it separately later
+// without breaking the existing status enum (still one of present/
+// late/absent — Phase 3 will surface almostLate as its own bucket).
+function calcStatus(now, cfg) {
+  const totalMin = now.hour() * 60 + now.minute();
+
+  // No config configured anywhere — fall back to the original hardcoded
+  // 9:00 schedule so a brand-new install with no shift_configs row
+  // still produces useful statuses.
+  if (!cfg) {
+    if (totalMin <= 9 * 60)        return { status: 'present', detail: 'เข้างานตรงเวลา', almostLate: false };
+    if (totalMin <= 9 * 60 + 9)    return { status: 'present', detail: 'เกือบสาย',       almostLate: true  };
+    if (totalMin <= 9 * 60 + 19)   return { status: 'late',    detail: 'สาย',            almostLate: false };
+    return { status: 'absent', detail: 'ขาดงาน', almostLate: false };
   }
 
-  // กะปกติ
-  if (totalMin <= 9 * 60) return { status: 'present', detail: 'เข้างานตรงเวลา' };
-  if (totalMin <= 9 * 60 + 9) return { status: 'present', detail: 'เกือบสาย' };
-  if (totalMin <= 9 * 60 + 19) return { status: 'late', detail: 'สาย' };
-  return { status: 'absent', detail: 'ขาดงาน' };
-};
+  // Flexible shift: the staggered tiers describe (latest-check-in, expected-checkout).
+  // Earliest tier the employee still qualifies for wins. If no tier
+  // matches, fall through to a single late grace period using
+  // late_threshold_minutes past the last tier's check-in cutoff.
+  if (cfg.shift_type === 'flexible' && Array.isArray(cfg.flex_tiers) && cfg.flex_tiers.length > 0) {
+    const sorted = [...cfg.flex_tiers].sort((a, b) => timeToMin(a.checkin_until) - timeToMin(b.checkin_until));
+    for (const tier of sorted) {
+      if (totalMin <= timeToMin(tier.checkin_until)) {
+        return { status: 'present', detail: `ออกงาน ${tier.checkout || '?'}`, almostLate: false };
+      }
+    }
+    const lastTier = sorted[sorted.length - 1];
+    const lastEnd = timeToMin(lastTier.checkin_until);
+    const lateMax = lastEnd + (cfg.late_threshold_minutes || 10);
+    if (totalMin <= lateMax) {
+      return { status: 'late', detail: `สาย (ออกงาน ${lastTier.checkout || '?'})`, almostLate: false };
+    }
+    return { status: 'absent', detail: 'ขาดงาน (เลยเวลาเช็คอินสุดท้าย)', almostLate: false };
+  }
+
+  // Normal shift: buckets cascade from work_start using the configured
+  // late_warning / late_threshold / absent_threshold offsets. Anything
+  // before (work_start + late_warning_minutes) is "ตรงเวลา" — that gap
+  // is the implicit grace window.
+  const workStart   = timeToMin(cfg.work_start || '09:00');
+  const lateWarn    = cfg.late_warning_minutes    ?? 1;
+  const lateTh      = cfg.late_threshold_minutes  ?? 10;
+  const absentTh    = cfg.absent_threshold_minutes ?? 20;
+
+  if (totalMin < workStart + lateWarn) return { status: 'present', detail: 'เข้างานตรงเวลา', almostLate: false };
+  if (totalMin < workStart + lateTh)   return { status: 'present', detail: 'เกือบสาย',       almostLate: true  };
+  if (totalMin < workStart + absentTh) return { status: 'late',    detail: 'สาย',            almostLate: false };
+  return { status: 'absent', detail: 'ขาดงาน', almostLate: false };
+}
 
 // POST /api/attendance/check-in
 const checkIn = async (req, res) => {
@@ -73,8 +149,14 @@ const checkIn = async (req, res) => {
       }
     }
 
-    // คำนวณสถานะ
-    const { status, detail } = calcStatus(now, emp.shift_type);
+    // Resolve the active shift config for today and compute status from it.
+    // This honors the weekly schedule + the rules HR set in /shifts (work_start,
+    // late thresholds, flex tiers), instead of the previous hardcoded 9:00.
+    const { config: shiftCfg, isDayOff } = await resolveShiftConfig(emp.id, today);
+    if (isDayOff) {
+      return res.status(400).json({ success: false, message: 'วันนี้เป็นวันหยุดของคุณ ไม่ต้องลงเวลา' });
+    }
+    const { status, detail } = calcStatus(now, shiftCfg);
 
     // บันทึก
     const result = await query(
@@ -145,17 +227,43 @@ const checkOut = async (req, res) => {
 };
 
 // GET /api/attendance/today
+// Also returns the active shift info so the UI can render the expected
+// work_start time + countdown ("เหลือ N นาทีก่อนสาย") without a
+// second round-trip to /shift-configs.
 const getToday = async (req, res) => {
   try {
     const today = dayjs().format('YYYY-MM-DD');
     const empResult = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
     if (!empResult.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลพนักงาน' });
+    const empId = empResult.rows[0].id;
 
-    const result = await query(
-      'SELECT * FROM attendance_logs WHERE employee_id = $1 AND date = $2',
-      [empResult.rows[0].id, today]
-    );
-    res.json({ success: true, data: result.rows[0] || null });
+    const [logRes, shift] = await Promise.all([
+      query('SELECT * FROM attendance_logs WHERE employee_id = $1 AND date = $2', [empId, today]),
+      resolveShiftConfig(empId, today),
+    ]);
+
+    const log = logRes.rows[0] || null;
+    const shiftPayload = shift.isDayOff
+      ? { isDayOff: true }
+      : shift.config
+        ? {
+            isDayOff: false,
+            id: shift.config.id,
+            code: shift.config.code,
+            name: shift.config.name,
+            shift_type: shift.config.shift_type,
+            work_start: shift.config.work_start,
+            work_end: shift.config.work_end,
+            checkin_start: shift.config.checkin_start,
+            checkin_end: shift.config.checkin_end,
+            late_warning_minutes: shift.config.late_warning_minutes,
+            late_threshold_minutes: shift.config.late_threshold_minutes,
+            absent_threshold_minutes: shift.config.absent_threshold_minutes,
+            flex_tiers: shift.config.flex_tiers,
+          }
+        : null;
+
+    res.json({ success: true, data: log, shift: shiftPayload });
   } catch (err) {
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
