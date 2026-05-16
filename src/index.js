@@ -239,6 +239,26 @@ async function ensureSchema() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_payroll_period ON payroll_records(year, month)
     `);
+    // Singleton org-wide settings (company name, address, etc.).
+    // Enforced single-row via PK = 1; everything else is a nullable column.
+    // Read by anyone authenticated; write by owner only (enforced in routes).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS org_settings (
+        id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        company_name TEXT,
+        company_name_en TEXT,
+        company_address TEXT,
+        company_phone VARCHAR(50),
+        company_email VARCHAR(200),
+        company_tax_id VARCHAR(50),
+        company_logo TEXT,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    // Seed the singleton row if missing — ON CONFLICT keeps it idempotent.
+    await client.query(`
+      INSERT INTO org_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING
+    `);
     console.log('🔧 schema check ok');
   } catch (e) {
     console.error('⚠️  schema check failed:', e.message);

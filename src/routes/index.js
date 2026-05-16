@@ -920,6 +920,49 @@ router.patch('/employees/:id/reset-password', authenticate, authorize('hr','owne
     res.json({success:true,message:'รีเซ็ตรหัสผ่านสำเร็จ'})
   } catch(err){res.status(500).json({success:false,message:'เกิดข้อผิดพลาด'})}
 })
+// ====== ORG SETTINGS ======
+// Singleton row at id=1. Read by anyone authenticated; write by owner only.
+router.get('/org-settings', authenticate, async (req, res) => {
+  try {
+    const r = await query('SELECT * FROM org_settings WHERE id = 1');
+    res.json({ success: true, data: r.rows[0] || null });
+  } catch (e) {
+    console.error('GET /org-settings error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.patch('/org-settings', authenticate, authorize('owner'), async (req, res) => {
+  const {
+    companyName, companyNameEn, companyAddress,
+    companyPhone, companyEmail, companyTaxId, companyLogo,
+  } = req.body;
+  // Logo size guard — base64 dataURL with same ~500KB cap as avatars.
+  if (companyLogo && typeof companyLogo === 'string' && companyLogo.length > 700 * 1024) {
+    return res.status(413).json({ success: false, message: 'โลโก้ใหญ่เกินไป (สูงสุด ~500KB)' });
+  }
+  try {
+    await query(
+      `UPDATE org_settings SET
+         company_name     = COALESCE($1, company_name),
+         company_name_en  = COALESCE($2, company_name_en),
+         company_address  = COALESCE($3, company_address),
+         company_phone    = COALESCE($4, company_phone),
+         company_email    = COALESCE($5, company_email),
+         company_tax_id   = COALESCE($6, company_tax_id),
+         company_logo     = COALESCE($7, company_logo),
+         updated_at = NOW()
+       WHERE id = 1`,
+      [companyName ?? null, companyNameEn ?? null, companyAddress ?? null,
+       companyPhone ?? null, companyEmail ?? null, companyTaxId ?? null, companyLogo ?? null]
+    );
+    res.json({ success: true, message: 'บันทึกข้อมูลบริษัทแล้ว' });
+  } catch (e) {
+    console.error('PATCH /org-settings error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
 // ====== PAYROLL ======
 // payroll_records is the master table of monthly slips. One row per
 // (employee, month, year). net_salary is a GENERATED column computed by
