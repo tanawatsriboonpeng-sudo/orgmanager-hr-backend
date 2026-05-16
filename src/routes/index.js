@@ -147,12 +147,12 @@ router.patch('/employees/me', authenticate, async (req, res) => {
 router.get('/shift-configs', authenticate, async (req, res) => {
   try {
     const r = await query(
-      `SELECT id, name, shift_type, description, work_days,
+      `SELECT id, name, code, shift_type, description, work_days,
               checkin_start, checkin_end, work_start, work_end,
               grace_minutes, late_warning_minutes, late_threshold_minutes, absent_threshold_minutes,
               flex_tiers, is_active
        FROM shift_configs
-       ORDER BY shift_type, name`
+       ORDER BY shift_type, code, name`
     );
     res.json({ success: true, data: r.rows });
   } catch (e) {
@@ -163,7 +163,7 @@ router.get('/shift-configs', authenticate, async (req, res) => {
 
 router.post('/shift-configs', authenticate, authorize('hr', 'owner'), async (req, res) => {
   const {
-    name, shiftType, description, workDays,
+    name, code, shiftType, description, workDays,
     checkinStart, checkinEnd, workStart, workEnd,
     graceMinutes, lateWarningMinutes, lateThresholdMinutes, absentThresholdMinutes,
     flexTiers
@@ -171,17 +171,25 @@ router.post('/shift-configs', authenticate, authorize('hr', 'owner'), async (req
   if (!name || !shiftType) {
     return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อและประเภทกะ' });
   }
+  // Auto-generate a code if not provided: WC + sequential number
+  let finalCode = code?.trim() || null;
+  if (!finalCode) {
+    try {
+      const seq = await query(`SELECT COUNT(*)::int AS n FROM shift_configs`);
+      finalCode = `WC${String((seq.rows[0].n || 0) + 1).padStart(3, '0')}`;
+    } catch { finalCode = null; }
+  }
   try {
     const r = await query(
       `INSERT INTO shift_configs (
-         name, shift_type, description, work_days,
+         name, code, shift_type, description, work_days,
          checkin_start, checkin_end, work_start, work_end,
          grace_minutes, late_warning_minutes, late_threshold_minutes, absent_threshold_minutes,
          flex_tiers
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        RETURNING *`,
       [
-        name, shiftType, description || null,
+        name, finalCode, shiftType, description || null,
         workDays || [1,2,3,4,5],
         checkinStart || '08:30',
         checkinEnd || '10:00',
@@ -196,6 +204,7 @@ router.post('/shift-configs', authenticate, authorize('hr', 'owner'), async (req
     );
     res.status(201).json({ success: true, message: 'สร้างกะแล้ว', data: r.rows[0] });
   } catch (err) {
+    if (err.code === '23505') return res.status(400).json({ success: false, message: 'มีโค้ดกะนี้อยู่แล้ว' });
     console.error('POST /shift-configs error:', err.message);
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
@@ -203,7 +212,7 @@ router.post('/shift-configs', authenticate, authorize('hr', 'owner'), async (req
 
 router.patch('/shift-configs/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
   const {
-    name, shiftType, description, workDays,
+    name, code, shiftType, description, workDays,
     checkinStart, checkinEnd, workStart, workEnd,
     graceMinutes, lateWarningMinutes, lateThresholdMinutes, absentThresholdMinutes,
     flexTiers, isActive
@@ -212,22 +221,23 @@ router.patch('/shift-configs/:id', authenticate, authorize('hr', 'owner'), async
     await query(
       `UPDATE shift_configs SET
          name = COALESCE($1, name),
-         shift_type = COALESCE($2, shift_type),
-         description = COALESCE($3, description),
-         work_days = COALESCE($4, work_days),
-         checkin_start = COALESCE($5, checkin_start),
-         checkin_end = COALESCE($6, checkin_end),
-         work_start = COALESCE($7, work_start),
-         work_end = COALESCE($8, work_end),
-         grace_minutes = COALESCE($9, grace_minutes),
-         late_warning_minutes = COALESCE($10, late_warning_minutes),
-         late_threshold_minutes = COALESCE($11, late_threshold_minutes),
-         absent_threshold_minutes = COALESCE($12, absent_threshold_minutes),
-         flex_tiers = COALESCE($13::jsonb, flex_tiers),
-         is_active = COALESCE($14, is_active)
-       WHERE id = $15`,
+         code = COALESCE($2, code),
+         shift_type = COALESCE($3, shift_type),
+         description = COALESCE($4, description),
+         work_days = COALESCE($5, work_days),
+         checkin_start = COALESCE($6, checkin_start),
+         checkin_end = COALESCE($7, checkin_end),
+         work_start = COALESCE($8, work_start),
+         work_end = COALESCE($9, work_end),
+         grace_minutes = COALESCE($10, grace_minutes),
+         late_warning_minutes = COALESCE($11, late_warning_minutes),
+         late_threshold_minutes = COALESCE($12, late_threshold_minutes),
+         absent_threshold_minutes = COALESCE($13, absent_threshold_minutes),
+         flex_tiers = COALESCE($14::jsonb, flex_tiers),
+         is_active = COALESCE($15, is_active)
+       WHERE id = $16`,
       [
-        name, shiftType, description, workDays,
+        name, code, shiftType, description, workDays,
         checkinStart, checkinEnd, workStart, workEnd,
         graceMinutes, lateWarningMinutes, lateThresholdMinutes, absentThresholdMinutes,
         flexTiers !== undefined ? JSON.stringify(flexTiers) : null,
@@ -237,6 +247,7 @@ router.patch('/shift-configs/:id', authenticate, authorize('hr', 'owner'), async
     );
     res.json({ success: true, message: 'อัปเดตกะแล้ว' });
   } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ success: false, message: 'มีโค้ดกะนี้อยู่แล้ว' });
     console.error('PATCH /shift-configs/:id error:', e.message);
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
@@ -284,12 +295,16 @@ router.post('/shifts/bulk', authenticate, authorize('hr', 'owner'), async (req, 
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ success: false, message: 'ไม่มีข้อมูล' });
   }
-  const allowed = new Set(['normal', 'flexible', 'dayoff']);
   try {
     let upserts = 0;
     let deletes = 0;
     for (const it of items) {
       if (!it.employeeId || !it.date) continue;
+      // "default" / empty → remove override so the cell falls back to
+      // employees.shift_type. Anything else is stored verbatim (it should
+      // be a shift_configs.code on the grid but we don't enforce that
+      // here so legacy values like "normal"/"flexible"/"dayoff" still
+      // work).
       if (it.shiftType === 'default' || it.shiftType === '' || it.shiftType == null) {
         await query(
           'DELETE FROM shift_assignments WHERE employee_id = $1 AND date = $2',
@@ -298,7 +313,6 @@ router.post('/shifts/bulk', authenticate, authorize('hr', 'owner'), async (req, 
         deletes++;
         continue;
       }
-      if (!allowed.has(it.shiftType)) continue;
       await query(
         `INSERT INTO shift_assignments (employee_id, date, shift_type, notes, created_by, updated_at)
          VALUES ($1, $2, $3, $4, $5, NOW())

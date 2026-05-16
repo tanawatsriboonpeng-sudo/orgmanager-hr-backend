@@ -94,6 +94,29 @@ async function ensureSchema() {
       ALTER TABLE shift_configs
       ADD COLUMN IF NOT EXISTS description TEXT
     `);
+    // Human-friendly code (e.g. "WC001") so HR can pick "WC001" / "WC002"
+    // on the weekly grid the way HumanSoft does. Unique, nullable for
+    // legacy rows.
+    await client.query(`
+      ALTER TABLE shift_configs
+      ADD COLUMN IF NOT EXISTS code VARCHAR(20)
+    `);
+    await client.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'shift_configs_code_unique'
+        ) THEN
+          ALTER TABLE shift_configs ADD CONSTRAINT shift_configs_code_unique UNIQUE (code);
+        END IF;
+      END $$;
+    `);
+    // The old CHECK constraint on shift_assignments.shift_type pinned us
+    // to ('normal','flexible','dayoff'). Drop it so a cell can now store
+    // any shift_configs.code value.
+    await client.query(`
+      ALTER TABLE shift_assignments
+      DROP CONSTRAINT IF EXISTS shift_assignments_shift_type_check
+    `);
     console.log('🔧 schema check ok');
   } catch (e) {
     console.error('⚠️  schema check failed:', e.message);
