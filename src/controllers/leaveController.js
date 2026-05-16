@@ -48,6 +48,40 @@ const getMyQuota = async (req, res) => {
   }
 };
 
+// GET /api/leave/all-quotas?year=YYYY
+// HR/owner overview: one row per (employee, leave_type) so the UI can
+// group by employee and render a per-team usage table. Owners aren't
+// counted — they have no quota row. Employees with no quota yet for the
+// year simply don't appear; this stays consistent with the per-employee
+// my-quota auto-seed behavior (we don't seed for everyone here).
+const getAllQuotas = async (req, res) => {
+  try {
+    const year = parseInt(req.query.year, 10) || dayjs().year();
+    const result = await query(
+      `SELECT lq.id, lq.employee_id, lq.leave_type_id, lq.year,
+              lq.total_days, lq.used_days, lq.remaining_days,
+              e.first_name, e.last_name, e.nickname, e.avatar_url,
+              e.employee_id AS emp_code, e.position,
+              d.name AS department_name,
+              lt.name AS leave_type_name, lt.code AS leave_type_code
+         FROM leave_quotas lq
+         JOIN employees e   ON lq.employee_id = e.id
+         JOIN leave_types lt ON lq.leave_type_id = lt.id
+         LEFT JOIN departments d ON e.department_id = d.id
+         LEFT JOIN users u      ON e.user_id = u.id
+        WHERE lq.year = $1
+          AND e.is_active = true
+          AND (u.role IS NULL OR u.role <> 'owner')
+        ORDER BY e.first_name, e.last_name, lt.name`,
+      [year]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (err) {
+    console.error('GET /leave/all-quotas error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
 // POST /api/leave/request
 const createRequest = async (req, res) => {
   // Mirrors the attendance/OT owner blocks — the owner has no quota and
@@ -241,4 +275,4 @@ const cancelRequest = async (req, res) => {
   }
 };
 
-module.exports = { getLeaveTypes, getMyQuota, createRequest, getPending, approveRequest, getMyHistory, cancelRequest };
+module.exports = { getLeaveTypes, getMyQuota, getAllQuotas, createRequest, getPending, approveRequest, getMyHistory, cancelRequest };

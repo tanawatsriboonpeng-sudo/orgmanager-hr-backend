@@ -32,6 +32,7 @@ router.get('/attendance/recent-summary', authenticate, authorize('owner', 'hr'),
 // ====== LEAVE ======
 router.get('/leave/types', authenticate, leaveCtrl.getLeaveTypes);
 router.get('/leave/my-quota', authenticate, leaveCtrl.getMyQuota);
+router.get('/leave/all-quotas', authenticate, authorize('hr', 'owner'), leaveCtrl.getAllQuotas);
 router.get('/leave/my-history', authenticate, leaveCtrl.getMyHistory);
 router.post('/leave/request', authenticate, leaveCtrl.createRequest);
 router.post('/leave/:id/cancel', authenticate, leaveCtrl.cancelRequest);
