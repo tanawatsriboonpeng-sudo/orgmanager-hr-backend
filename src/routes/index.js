@@ -116,11 +116,53 @@ router.get('/employees/me', authenticate, async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
 });
 
-// Self-edit (employee can update own non-sensitive fields)
+// Single employee by id. HR/owner can view anyone; employee can only
+// view themselves.
+router.get('/employees/:id', authenticate, async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT e.*, u.email, u.role, u.is_active as account_active, u.last_login_at,
+              d.name as department_name,
+              m.first_name as manager_first_name, m.last_name as manager_last_name
+       FROM employees e
+       LEFT JOIN users u ON e.user_id = u.id
+       LEFT JOIN departments d ON e.department_id = d.id
+       LEFT JOIN employees m ON e.manager_id = m.id
+       WHERE e.id = $1`,
+      [req.params.id]
+    );
+    const emp = r.rows[0];
+    if (!emp) return res.status(404).json({ success: false, message: 'ไม่พบพนักงาน' });
+    // Permission: HR/owner can see anyone; employee can only see own row
+    if (req.user.role !== 'hr' && req.user.role !== 'owner') {
+      const own = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
+      if (!own.rows[0] || own.rows[0].id !== emp.id) {
+        return res.status(403).json({ success: false, message: 'ไม่มีสิทธิ์ดู' });
+      }
+    }
+    res.json({ success: true, data: emp });
+  } catch (e) {
+    console.error('GET /employees/:id error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// Self-edit (employee can update own non-sensitive fields).
+// Allowed: personal identity, contact info, address, ID/bank documents.
+// NOT allowed: position, salary, role, department, employee_id, hire dates,
+// employment_type — those need HR/owner approval.
 router.patch('/employees/me', authenticate, async (req, res) => {
-  const { nickname, phone, avatarUrl } = req.body;
-  // Avatar size guard: base64 strings can be huge. Reject anything > ~700 KB
-  // which is roughly a 500 KB image after base64 inflation.
+  const {
+    nickname, phone, avatarUrl,
+    // Personal
+    title, firstNameEn, lastNameEn, nicknameEn,
+    gender, nationality, maritalStatus, dateOfBirth, address,
+    // IDs
+    nationalId, passportNumber, socialSecurityNumber, taxId,
+    // Bank
+    bankAccount, bankName, bankBranchCode,
+  } = req.body;
+  // Avatar size guard
   if (avatarUrl && typeof avatarUrl === 'string' && avatarUrl.length > 700 * 1024) {
     return res.status(413).json({ success: false, message: 'รูปภาพใหญ่เกินไป (สูงสุด ~500KB)' });
   }
@@ -130,9 +172,31 @@ router.patch('/employees/me', authenticate, async (req, res) => {
          nickname = COALESCE($1, nickname),
          phone = COALESCE($2, phone),
          avatar_url = COALESCE($3, avatar_url),
+         title = COALESCE($5, title),
+         first_name_en = COALESCE($6, first_name_en),
+         last_name_en = COALESCE($7, last_name_en),
+         nickname_en = COALESCE($8, nickname_en),
+         gender = COALESCE($9, gender),
+         nationality = COALESCE($10, nationality),
+         marital_status = COALESCE($11, marital_status),
+         date_of_birth = COALESCE($12, date_of_birth),
+         address = COALESCE($13, address),
+         national_id = COALESCE($14, national_id),
+         passport_number = COALESCE($15, passport_number),
+         social_security_number = COALESCE($16, social_security_number),
+         tax_id = COALESCE($17, tax_id),
+         bank_account = COALESCE($18, bank_account),
+         bank_name = COALESCE($19, bank_name),
+         bank_branch_code = COALESCE($20, bank_branch_code),
          updated_at = NOW()
        WHERE user_id = $4`,
-      [nickname ?? null, phone ?? null, avatarUrl ?? null, req.user.id]
+      [
+        nickname ?? null, phone ?? null, avatarUrl ?? null, req.user.id,
+        title ?? null, firstNameEn ?? null, lastNameEn ?? null, nicknameEn ?? null,
+        gender ?? null, nationality ?? null, maritalStatus ?? null, dateOfBirth ?? null, address ?? null,
+        nationalId ?? null, passportNumber ?? null, socialSecurityNumber ?? null, taxId ?? null,
+        bankAccount ?? null, bankName ?? null, bankBranchCode ?? null,
+      ]
     );
     res.json({ success: true, message: 'อัปเดตข้อมูลส่วนตัวแล้ว' });
   } catch (e) {
@@ -675,7 +739,19 @@ router.patch('/employees/:id', authenticate, authorize('hr','owner'), async (req
     position, department, shiftType, baseSalary, role,
     managerId, avatarUrl,
     bankAccount, bankName, nationalId,
-    workDays
+    workDays,
+    // Personal
+    title, firstNameEn, lastNameEn, nicknameEn,
+    gender, nationality, maritalStatus, dateOfBirth, address,
+    // IDs
+    passportNumber, socialSecurityNumber, taxId, fingerprintCode,
+    // Employment
+    hireDate, retirementYear, probationDays, probationEndDate,
+    contractEndDate, employmentType, startDate,
+    // Bank / payroll
+    bankBranchCode, paymentMethod,
+    // Free-form
+    notes, hashtags,
   } = req.body
   // Avatar size guard
   if (avatarUrl && typeof avatarUrl === 'string' && avatarUrl.length > 700 * 1024) {
@@ -712,6 +788,35 @@ router.patch('/employees/:id', authenticate, authorize('hr','owner'), async (req
          bank_name     = COALESCE($12, bank_name),
          national_id   = COALESCE($13, national_id),
          work_days     = COALESCE($14, work_days),
+         -- Personal
+         title              = COALESCE($16, title),
+         first_name_en      = COALESCE($17, first_name_en),
+         last_name_en       = COALESCE($18, last_name_en),
+         nickname_en        = COALESCE($19, nickname_en),
+         gender             = COALESCE($20, gender),
+         nationality        = COALESCE($21, nationality),
+         marital_status     = COALESCE($22, marital_status),
+         date_of_birth      = COALESCE($23, date_of_birth),
+         address            = COALESCE($24, address),
+         -- IDs
+         passport_number    = COALESCE($25, passport_number),
+         social_security_number = COALESCE($26, social_security_number),
+         tax_id             = COALESCE($27, tax_id),
+         fingerprint_code   = COALESCE($28, fingerprint_code),
+         -- Employment
+         hire_date          = COALESCE($29, hire_date),
+         retirement_year    = COALESCE($30, retirement_year),
+         probation_days     = COALESCE($31, probation_days),
+         probation_end_date = COALESCE($32, probation_end_date),
+         contract_end_date  = COALESCE($33, contract_end_date),
+         employment_type    = COALESCE($34, employment_type),
+         start_date         = COALESCE($35, start_date),
+         -- Bank / payroll
+         bank_branch_code   = COALESCE($36, bank_branch_code),
+         payment_method     = COALESCE($37, payment_method),
+         -- Free-form
+         notes              = COALESCE($38, notes),
+         hashtags           = COALESCE($39, hashtags),
          updated_at = NOW()
        WHERE id = $15`,
       [firstName, lastName, nickname, phone,
@@ -719,7 +824,15 @@ router.patch('/employees/:id', authenticate, authorize('hr','owner'), async (req
        resolvedManagerId, avatarUrl,
        bankAccount, bankName, nationalId,
        Array.isArray(workDays) ? workDays : null,
-       req.params.id]
+       req.params.id,
+       title, firstNameEn, lastNameEn, nicknameEn,
+       gender, nationality, maritalStatus, dateOfBirth, address,
+       passportNumber, socialSecurityNumber, taxId, fingerprintCode,
+       hireDate, retirementYear, probationDays, probationEndDate,
+       contractEndDate, employmentType, startDate,
+       bankBranchCode, paymentMethod,
+       notes, Array.isArray(hashtags) ? hashtags : null,
+      ]
     )
 
     // Role change is owner-only

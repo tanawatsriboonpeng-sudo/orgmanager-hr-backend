@@ -151,6 +151,42 @@ async function ensureSchema() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_positions_parent ON positions(parent_id)
     `);
+    // Comprehensive HumanSoft-style employee profile fields. Mostly
+    // optional — the form lets owner/HR fill them in over time and the
+    // employee themselves can self-edit a safe subset.
+    const employeeColumns = [
+      // Personal — names & demographics
+      ['title',              'VARCHAR(50)'],   // คำนำหน้าชื่อ
+      ['first_name_en',      'VARCHAR(100)'],
+      ['last_name_en',       'VARCHAR(100)'],
+      ['nickname_en',        'VARCHAR(50)'],
+      ['gender',             'VARCHAR(20)'],   // male/female/other
+      ['nationality',        'VARCHAR(50)'],   // ไทย/ต่างชาติ
+      ['marital_status',     'VARCHAR(20)'],   // โสด/สมรส/หย่า/หม้าย
+      ['date_of_birth',      'DATE'],
+      ['address',            'TEXT'],          // ที่อยู่
+      // ID documents (national_id already exists)
+      ['passport_number',    'VARCHAR(50)'],
+      ['social_security_number', 'VARCHAR(50)'],
+      // Employment (start_date / contract_end_date already exist)
+      ['hire_date',          'DATE'],          // วันที่บรรจุ
+      ['retirement_year',    'INT'],
+      ['probation_days',     'INT'],
+      ['probation_end_date', 'DATE'],
+      ['fingerprint_code',   'VARCHAR(50)'],
+      // Bank / payroll (bank_account / bank_name already exist)
+      ['bank_branch_code',   'VARCHAR(20)'],
+      ['payment_method',     'VARCHAR(20)'],   // transfer/cash/cheque
+      ['tax_id',             'VARCHAR(20)'],
+      // Free-form
+      ['notes',              'TEXT'],
+      ['hashtags',           'TEXT[]'],
+    ];
+    for (const [name, type] of employeeColumns) {
+      await client.query(
+        `ALTER TABLE employees ADD COLUMN IF NOT EXISTS ${name} ${type}`
+      );
+    }
     console.log('🔧 schema check ok');
   } catch (e) {
     console.error('⚠️  schema check failed:', e.message);
