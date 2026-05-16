@@ -56,6 +56,22 @@ async function ensureSchema() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_shift_assignments_employee_date ON shift_assignments(employee_id, date)
     `);
+    // late_warning_minutes = how many minutes after work_start counts as
+    // "เกือบสาย" (between grace_minutes and late_threshold_minutes).
+    // flex_tiers = JSON array of {checkin_until: "HH:MM", checkout: "HH:MM"}
+    // describing the staggered flexible-shift schedule.
+    await client.query(`
+      ALTER TABLE shift_configs
+      ADD COLUMN IF NOT EXISTS late_warning_minutes INT DEFAULT 1
+    `);
+    await client.query(`
+      ALTER TABLE shift_configs
+      ADD COLUMN IF NOT EXISTS flex_tiers JSONB DEFAULT '[]'::jsonb
+    `);
+    await client.query(`
+      ALTER TABLE shift_configs
+      ADD COLUMN IF NOT EXISTS description TEXT
+    `);
     console.log('🔧 schema check ok');
   } catch (e) {
     console.error('⚠️  schema check failed:', e.message);

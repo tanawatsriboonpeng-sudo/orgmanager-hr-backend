@@ -141,6 +141,116 @@ router.patch('/employees/me', authenticate, async (req, res) => {
   }
 });
 
+// ====== SHIFT CONFIGS (rules) ======
+// Defines the rules for each shift type: work hours, late/absent
+// thresholds, and (for flex shifts) the staggered tier table.
+router.get('/shift-configs', authenticate, async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT id, name, shift_type, description, work_days,
+              checkin_start, checkin_end, work_start, work_end,
+              grace_minutes, late_warning_minutes, late_threshold_minutes, absent_threshold_minutes,
+              flex_tiers, is_active
+       FROM shift_configs
+       ORDER BY shift_type, name`
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (e) {
+    console.error('GET /shift-configs error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.post('/shift-configs', authenticate, authorize('hr', 'owner'), async (req, res) => {
+  const {
+    name, shiftType, description, workDays,
+    checkinStart, checkinEnd, workStart, workEnd,
+    graceMinutes, lateWarningMinutes, lateThresholdMinutes, absentThresholdMinutes,
+    flexTiers
+  } = req.body;
+  if (!name || !shiftType) {
+    return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อและประเภทกะ' });
+  }
+  try {
+    const r = await query(
+      `INSERT INTO shift_configs (
+         name, shift_type, description, work_days,
+         checkin_start, checkin_end, work_start, work_end,
+         grace_minutes, late_warning_minutes, late_threshold_minutes, absent_threshold_minutes,
+         flex_tiers
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       RETURNING *`,
+      [
+        name, shiftType, description || null,
+        workDays || [1,2,3,4,5],
+        checkinStart || '08:30',
+        checkinEnd || '10:00',
+        workStart || '09:00',
+        workEnd || '17:00',
+        graceMinutes ?? 0,
+        lateWarningMinutes ?? 1,
+        lateThresholdMinutes ?? 10,
+        absentThresholdMinutes ?? 20,
+        JSON.stringify(flexTiers || [])
+      ]
+    );
+    res.status(201).json({ success: true, message: 'สร้างกะแล้ว', data: r.rows[0] });
+  } catch (err) {
+    console.error('POST /shift-configs error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.patch('/shift-configs/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
+  const {
+    name, shiftType, description, workDays,
+    checkinStart, checkinEnd, workStart, workEnd,
+    graceMinutes, lateWarningMinutes, lateThresholdMinutes, absentThresholdMinutes,
+    flexTiers, isActive
+  } = req.body;
+  try {
+    await query(
+      `UPDATE shift_configs SET
+         name = COALESCE($1, name),
+         shift_type = COALESCE($2, shift_type),
+         description = COALESCE($3, description),
+         work_days = COALESCE($4, work_days),
+         checkin_start = COALESCE($5, checkin_start),
+         checkin_end = COALESCE($6, checkin_end),
+         work_start = COALESCE($7, work_start),
+         work_end = COALESCE($8, work_end),
+         grace_minutes = COALESCE($9, grace_minutes),
+         late_warning_minutes = COALESCE($10, late_warning_minutes),
+         late_threshold_minutes = COALESCE($11, late_threshold_minutes),
+         absent_threshold_minutes = COALESCE($12, absent_threshold_minutes),
+         flex_tiers = COALESCE($13::jsonb, flex_tiers),
+         is_active = COALESCE($14, is_active)
+       WHERE id = $15`,
+      [
+        name, shiftType, description, workDays,
+        checkinStart, checkinEnd, workStart, workEnd,
+        graceMinutes, lateWarningMinutes, lateThresholdMinutes, absentThresholdMinutes,
+        flexTiers !== undefined ? JSON.stringify(flexTiers) : null,
+        isActive,
+        req.params.id
+      ]
+    );
+    res.json({ success: true, message: 'อัปเดตกะแล้ว' });
+  } catch (e) {
+    console.error('PATCH /shift-configs/:id error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.delete('/shift-configs/:id', authenticate, authorize('owner'), async (req, res) => {
+  try {
+    await query('DELETE FROM shift_configs WHERE id = $1', [req.params.id]);
+    res.json({ success: true, message: 'ลบกะแล้ว' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
 // ====== SHIFT ASSIGNMENTS ======
 // GET /api/shifts?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
 // Returns one record per (employee, date) that has been explicitly assigned.
