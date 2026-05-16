@@ -124,6 +124,12 @@ async function ensureSchema() {
       ALTER TABLE employees
       ADD COLUMN IF NOT EXISTS work_days INTEGER[] DEFAULT ARRAY[1,2,3,4,5]
     `);
+    // avatar_url was VARCHAR(500) in the original schema — too small for
+    // base64 dataURLs (a resized photo is ~50–100KB / 50–100k chars).
+    // Widen to TEXT so it can hold the dataURL we generate client-side.
+    await client.query(`
+      ALTER TABLE employees ALTER COLUMN avatar_url TYPE TEXT
+    `).catch(() => {});
     // employees.weekly_shifts is the recurring weekly schedule. JSON shape:
     //   { "0": "dayoff", "1": "WC001", "2": "WC001", ..., "6": "dayoff" }
     // Keys are day-of-week numbers (0=Sun..6=Sat). Values are either a
