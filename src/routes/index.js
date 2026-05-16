@@ -40,7 +40,8 @@ router.patch('/leave/:id/approve', authenticate, authorize('hr'), auditLog('leav
 router.get('/ot/pending', authenticate, authorize('hr', 'owner'), async (req, res) => {
   try {
     const result = await query(
-      `SELECT o.*, e.first_name, e.last_name, e.employee_id as emp_code, d.name as department
+      `SELECT o.*, e.first_name, e.last_name, e.nickname, e.avatar_url,
+              e.employee_id as emp_code, d.name as department
        FROM ot_requests o
        JOIN employees e ON o.employee_id = e.id
        LEFT JOIN departments d ON e.department_id = d.id

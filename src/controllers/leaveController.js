@@ -108,7 +108,8 @@ const getPending = async (req, res) => {
   try {
     const result = await query(
       `SELECT lr.*, lt.name as leave_type_name,
-              e.first_name, e.last_name, e.employee_id as emp_code,
+              e.first_name, e.last_name, e.nickname, e.avatar_url,
+              e.employee_id as emp_code,
               d.name as department
        FROM leave_requests lr
        JOIN employees e ON lr.employee_id = e.id
