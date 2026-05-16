@@ -25,7 +25,17 @@ async function ensureSchema() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_employees_manager ON employees(manager_id)
     `);
-    console.log('🔧 schema check ok (manager_id ensured)');
+    // Older databases were created before departments.manager_id was added
+    // to migrate.js, so add it defensively here too.
+    await client.query(`
+      ALTER TABLE departments
+      ADD COLUMN IF NOT EXISTS manager_id UUID
+    `);
+    await client.query(`
+      ALTER TABLE departments
+      ADD COLUMN IF NOT EXISTS description TEXT
+    `);
+    console.log('🔧 schema check ok');
   } catch (e) {
     console.error('⚠️  schema check failed:', e.message);
   } finally {

@@ -144,7 +144,7 @@ router.get('/departments', authenticate, async (req, res) => {
     res.json({ success: true, data: r.rows });
   } catch (e) {
     console.error('GET /departments error:', e.message, e.stack);
-    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด', debug: e.message });
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
 });
 
@@ -162,7 +162,7 @@ router.post('/departments', authenticate, authorize('hr', 'owner'), async (req, 
   } catch (err) {
     if (err.code === '23505') return res.status(400).json({ success: false, message: 'มีแผนกชื่อนี้อยู่แล้ว' });
     console.error('POST /departments error:', err.message, err.stack);
-    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด', debug: err.message });
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
 });
 
