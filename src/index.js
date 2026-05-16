@@ -117,6 +117,13 @@ async function ensureSchema() {
       ALTER TABLE shift_assignments
       DROP CONSTRAINT IF EXISTS shift_assignments_shift_type_check
     `);
+    // employees.work_days lists weekday numbers (0=Sun, 1=Mon, ... 6=Sat)
+    // that the employee is scheduled to work by default. Used by the
+    // "วันทำงาน/วันหยุดพนักงาน" grid in /shifts.
+    await client.query(`
+      ALTER TABLE employees
+      ADD COLUMN IF NOT EXISTS work_days INTEGER[] DEFAULT ARRAY[1,2,3,4,5]
+    `);
     console.log('🔧 schema check ok');
   } catch (e) {
     console.error('⚠️  schema check failed:', e.message);

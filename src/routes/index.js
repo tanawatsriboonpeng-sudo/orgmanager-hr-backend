@@ -588,7 +588,8 @@ router.patch('/employees/:id', authenticate, authorize('hr','owner'), async (req
     firstName, lastName, nickname, phone,
     position, department, shiftType, baseSalary, role,
     managerId, avatarUrl,
-    bankAccount, bankName, nationalId
+    bankAccount, bankName, nationalId,
+    workDays
   } = req.body
   // Avatar size guard
   if (avatarUrl && typeof avatarUrl === 'string' && avatarUrl.length > 700 * 1024) {
@@ -624,12 +625,14 @@ router.patch('/employees/:id', authenticate, authorize('hr','owner'), async (req
          bank_account  = COALESCE($11, bank_account),
          bank_name     = COALESCE($12, bank_name),
          national_id   = COALESCE($13, national_id),
+         work_days     = COALESCE($14, work_days),
          updated_at = NOW()
-       WHERE id = $14`,
+       WHERE id = $15`,
       [firstName, lastName, nickname, phone,
        position, deptId, shiftType, baseSalary,
        resolvedManagerId, avatarUrl,
        bankAccount, bankName, nationalId,
+       Array.isArray(workDays) ? workDays : null,
        req.params.id]
     )
 
@@ -642,6 +645,30 @@ router.patch('/employees/:id', authenticate, authorize('hr','owner'), async (req
   } catch (err) {
     console.error('PATCH /employees/:id error:', err.message)
     res.status(500).json({success:false, message:'เกิดข้อผิดพลาด'})
+  }
+})
+
+// Bulk update work_days for many employees at once — used by the
+// "วันทำงาน/วันหยุด" grid which lets HR change several rows then save once.
+router.post('/employees/work-days/bulk', authenticate, authorize('hr','owner'), async (req, res) => {
+  const { items } = req.body
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ success: false, message: 'ไม่มีข้อมูล' })
+  }
+  try {
+    let updated = 0
+    for (const it of items) {
+      if (!it.employeeId || !Array.isArray(it.workDays)) continue
+      await query(
+        'UPDATE employees SET work_days = $1, updated_at = NOW() WHERE id = $2',
+        [it.workDays, it.employeeId]
+      )
+      updated++
+    }
+    res.json({ success: true, message: `บันทึก ${updated} รายการ`, data: { updated } })
+  } catch (e) {
+    console.error('POST /employees/work-days/bulk error:', e.message)
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' })
   }
 })
 
