@@ -27,6 +27,7 @@ router.post('/attendance/check-out', authenticate, blockOwner, attendCtrl.checkO
 router.get('/attendance/today', authenticate, attendCtrl.getToday);
 router.get('/attendance/my-history', authenticate, attendCtrl.getMyHistory);
 router.get('/attendance/daily-summary', authenticate, authorize('owner', 'hr'), attendCtrl.getDailySummary);
+router.get('/attendance/recent-summary', authenticate, authorize('owner', 'hr'), attendCtrl.getRecentSummary);
 
 // ====== LEAVE ======
 router.get('/leave/types', authenticate, leaveCtrl.getLeaveTypes);

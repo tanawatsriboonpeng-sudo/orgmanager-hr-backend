@@ -207,6 +207,65 @@ const getDailySummary = async (req, res) => {
   }
 };
 
+// GET /api/attendance/recent-summary?days=5
+// Returns one row per day for the last N working days (Mon–Fri).
+// Used by the dashboard's "การมาทำงาน X วัน" chart so it stops showing
+// hardcoded mock numbers. HR/owner only.
+const getRecentSummary = async (req, res) => {
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 5, 1), 31);
+    const end = dayjs();
+
+    // Collect last N working days going backwards from today.
+    const dates = [];
+    let cur = end;
+    while (dates.length < days) {
+      if (cur.day() !== 0 && cur.day() !== 6) dates.push(cur.format('YYYY-MM-DD'));
+      cur = cur.subtract(1, 'day');
+    }
+    dates.reverse();
+
+    const start = dates[0];
+    const stop  = dates[dates.length - 1];
+
+    const result = await query(
+      `SELECT date::text AS d,
+              COUNT(*) FILTER (WHERE status = 'present')::int   AS present,
+              COUNT(*) FILTER (WHERE status = 'late')::int      AS late,
+              COUNT(*) FILTER (WHERE status = 'absent')::int    AS absent,
+              COUNT(*) FILTER (WHERE status = 'leave')::int     AS leave,
+              COUNT(*) FILTER (WHERE status = 'very_late')::int AS very_late
+       FROM attendance_logs
+       WHERE date BETWEEN $1 AND $2
+       GROUP BY date`,
+      [start, stop]
+    );
+    const byDate = {};
+    for (const r of result.rows) byDate[r.d] = r;
+
+    // Thai single-char day labels (Sun..Sat) to match the dashboard's
+    // existing axis style: อา / จ / อ / พ / พฤ / ศ / ส.
+    const DAY_TH = ['อา', 'จ', 'อ', 'พ', 'พฤ', 'ศ', 'ส'];
+    const rows = dates.map(d => {
+      const dow = dayjs(d).day();
+      const row = byDate[d] || { present: 0, late: 0, absent: 0, leave: 0, very_late: 0 };
+      return {
+        date: d,
+        day: DAY_TH[dow],
+        present: row.present,
+        late: row.late + row.very_late, // collapse very_late into late
+        absent: row.absent,
+        leave: row.leave,
+      };
+    });
+
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error('GET /attendance/recent-summary error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
 // GET /api/attendance/my-history?month=5&year=2025
 const getMyHistory = async (req, res) => {
   try {
@@ -237,4 +296,4 @@ const getMyHistory = async (req, res) => {
   }
 };
 
-module.exports = { checkIn, checkOut, getToday, getDailySummary, getMyHistory };
+module.exports = { checkIn, checkOut, getToday, getDailySummary, getMyHistory, getRecentSummary };
