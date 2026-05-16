@@ -842,8 +842,8 @@ router.patch('/employees/:id', authenticate, authorize('hr','owner'), async (req
     }
     res.json({success:true, message:'อัปเดตสำเร็จ'})
   } catch (err) {
-    console.error('PATCH /employees/:id error:', err.message, err.stack)
-    res.status(500).json({success:false, message:'เกิดข้อผิดพลาด', debug: err.message})
+    console.error('PATCH /employees/:id error:', err.message)
+    res.status(500).json({success:false, message:'เกิดข้อผิดพลาด'})
   }
 })
 

@@ -168,16 +168,23 @@ async function ensureSchema() {
       // ID documents (national_id already exists)
       ['passport_number',    'VARCHAR(50)'],
       ['social_security_number', 'VARCHAR(50)'],
-      // Employment (start_date / contract_end_date already exist)
+      // Employment — legacy DBs may not have these even though they're
+      // in migrate.js, so defensively add.
+      ['start_date',         'DATE'],
+      ['contract_end_date',  'DATE'],
+      ['employment_type',    'VARCHAR(20)'],
       ['hire_date',          'DATE'],          // วันที่บรรจุ
       ['retirement_year',    'INT'],
       ['probation_days',     'INT'],
       ['probation_end_date', 'DATE'],
       ['fingerprint_code',   'VARCHAR(50)'],
-      // Bank / payroll (bank_account / bank_name already exist)
+      // Bank / payroll — legacy DBs may not have bank_account / bank_name
+      ['bank_account',       'VARCHAR(50)'],
+      ['bank_name',          'VARCHAR(100)'],
       ['bank_branch_code',   'VARCHAR(20)'],
       ['payment_method',     'VARCHAR(20)'],   // transfer/cash/cheque
       ['tax_id',             'VARCHAR(20)'],
+      ['national_id',        'VARCHAR(20)'],
       // Free-form
       ['notes',              'TEXT'],
       ['hashtags',           'TEXT[]'],
