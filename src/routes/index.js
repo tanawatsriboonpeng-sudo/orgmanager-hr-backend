@@ -183,6 +183,32 @@ router.get('/employees', authenticate, authorize('hr', 'owner'), async (req, res
   } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
 });
 
+// Direct reports of the calling user. Any authenticated user can hit this
+// (managers in this system are just employees with subordinates pointing
+// at them via employees.manager_id) — the rows are filtered server-side
+// to the caller's reports, so plain employees with no subordinates get
+// an empty array rather than a 403.
+// Used by the /kpi page so managers (role=employee) can pick someone
+// to review without needing to list the whole company.
+router.get('/employees/my-subordinates', authenticate, async (req, res) => {
+  try {
+    const result = await query(
+      `SELECT e.*, u.email, u.role, d.name as department_name
+         FROM employees e
+         LEFT JOIN users u ON e.user_id = u.id
+         LEFT JOIN departments d ON e.department_id = d.id
+        WHERE e.is_active = true
+          AND e.manager_id = (SELECT id FROM employees WHERE user_id = $1)
+        ORDER BY e.first_name`,
+      [req.user.id]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (e) {
+    console.error('GET /employees/my-subordinates error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
 router.get('/employees/me', authenticate, async (req, res) => {
   try {
     const result = await query(
