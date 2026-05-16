@@ -779,17 +779,60 @@ router.patch('/tasks/:id', authenticate, async (req, res) => {
 });
 
 // ====== AUDIT LOG ======
+// Owner-only viewer. HR can read but typically owner cares most.
+// Filters: action, resource, userId, from, to (ISO date), limit, offset.
 router.get('/audit-logs', authenticate, authorize('owner', 'hr'), async (req, res) => {
   try {
-    const result = await query(
-      `SELECT al.*, u.email, u.role, CONCAT(e.first_name,' ',e.last_name) as user_name
-       FROM audit_logs al
-       LEFT JOIN users u ON al.user_id = u.id
-       LEFT JOIN employees e ON u.id = e.user_id
-       ORDER BY al.created_at DESC LIMIT 100`
-    );
-    res.json({ success: true, data: result.rows });
-  } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
+    const { action, resource, userId, from, to } = req.query;
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+    const where = [];
+    const params = [];
+    const push = (clause, value) => { params.push(value); where.push(clause.replace('$$', `$${params.length}`)); };
+
+    if (action)   push('al.action = $$', action);
+    if (resource) push('al.resource = $$', resource);
+    if (userId)   push('al.user_id = $$', userId);
+    if (from)     push('al.created_at >= $$', from);
+    if (to)       push('al.created_at <= $$', to);
+
+    const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
+    params.push(limit); const limitIdx = params.length;
+    params.push(offset); const offsetIdx = params.length;
+
+    const [rows, countRes, actionsRes] = await Promise.all([
+      query(
+        `SELECT al.*, u.email, u.role,
+                CONCAT(e.first_name, ' ', e.last_name) AS user_name,
+                e.nickname AS user_nickname, e.avatar_url AS user_avatar
+         FROM audit_logs al
+         LEFT JOIN users u ON al.user_id = u.id
+         LEFT JOIN employees e ON u.id = e.user_id
+         ${whereSql}
+         ORDER BY al.created_at DESC
+         LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+        params
+      ),
+      query(`SELECT COUNT(*)::int AS n FROM audit_logs al ${whereSql}`, params.slice(0, params.length - 2)),
+      // Distinct action list (small table by definition) so the UI can
+      // populate the action filter dropdown without a separate endpoint.
+      query(`SELECT DISTINCT action FROM audit_logs ORDER BY action`),
+    ]);
+
+    res.json({
+      success: true,
+      data: rows.rows,
+      meta: {
+        total: countRes.rows[0]?.n || 0,
+        limit, offset,
+        knownActions: actionsRes.rows.map(r => r.action),
+      },
+    });
+  } catch (e) {
+    console.error('GET /audit-logs error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
 });
 
 // ====== HEALTH CHECK ======
