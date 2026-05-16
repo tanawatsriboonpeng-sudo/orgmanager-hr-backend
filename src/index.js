@@ -220,6 +220,30 @@ async function ensureSchema() {
         `ALTER TABLE employees ADD COLUMN IF NOT EXISTS ${name} ${type}`
       );
     }
+    // Audit log table — defensively created here because the middleware's
+    // INSERT silently swallows errors (so it never breaks the actual API
+    // response), which meant a missing table on legacy DBs caused every
+    // single audit event to vanish without a trace. With this in place
+    // the /audit-logs viewer actually has data to display.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+        action VARCHAR(100) NOT NULL,
+        resource VARCHAR(100),
+        resource_id VARCHAR(100),
+        details JSONB,
+        ip_address INET,
+        device_info VARCHAR(500),
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_audit_logs_user ON audit_logs(user_id)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC)
+    `);
     // Payroll. Legacy DBs created before migrate.js added payroll_records
     // won't have this table, so create it defensively on every boot.
     // net_salary is a GENERATED column — Postgres recomputes it on every
