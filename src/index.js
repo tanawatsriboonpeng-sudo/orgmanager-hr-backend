@@ -244,6 +244,14 @@ async function ensureSchema() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC)
     `);
+    // Selfie at check-in: base64 JPEG dataURL captured client-side. TEXT
+    // because dataURLs run ~30-100KB after resize + JPEG compression, far
+    // past any VARCHAR limit. Used by HR to verify the person who tapped
+    // "เช็คอิน" is actually them, not a buddy clocking in from elsewhere.
+    await client.query(`
+      ALTER TABLE attendance_logs
+      ADD COLUMN IF NOT EXISTS check_in_selfie TEXT
+    `);
     // Payroll. Legacy DBs created before migrate.js added payroll_records
     // won't have this table, so create it defensively on every boot.
     // net_salary is a GENERATED column — Postgres recomputes it on every

@@ -107,9 +107,15 @@ function calcStatus(now, cfg) {
 // POST /api/attendance/check-in
 const checkIn = async (req, res) => {
   try {
-    const { lat, lng, method = 'gps' } = req.body;
+    const { lat, lng, method = 'gps', selfie } = req.body;
     const today = dayjs().format('YYYY-MM-DD');
     const now = dayjs();
+
+    // Selfie size guard. ~500KB cap is enough for a 480px JPEG at ~0.7
+    // quality and keeps the Postgres row well under TOAST thresholds.
+    if (selfie && typeof selfie === 'string' && selfie.length > 700 * 1024) {
+      return res.status(413).json({ success: false, message: 'รูปเซลฟี่ใหญ่เกินไป (สูงสุด ~500KB)' });
+    }
 
     // ดึงข้อมูล employee
     const empResult = await query(
@@ -161,13 +167,15 @@ const checkIn = async (req, res) => {
     // บันทึก
     const result = await query(
       `INSERT INTO attendance_logs
-        (employee_id, date, check_in_at, check_in_lat, check_in_lng, check_in_distance_m, check_in_method, status, status_detail)
-       VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7, $8)
+        (employee_id, date, check_in_at, check_in_lat, check_in_lng, check_in_distance_m, check_in_method, status, status_detail, check_in_selfie)
+       VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7, $8, $9)
        ON CONFLICT (employee_id, date) DO UPDATE SET
         check_in_at = NOW(), check_in_lat = $3, check_in_lng = $4,
-        check_in_distance_m = $5, check_in_method = $6, status = $7, status_detail = $8, updated_at = NOW()
+        check_in_distance_m = $5, check_in_method = $6, status = $7, status_detail = $8,
+        check_in_selfie = COALESCE($9, attendance_logs.check_in_selfie),
+        updated_at = NOW()
        RETURNING *`,
-      [emp.id, today, lat, lng, distanceM, method, status, detail]
+      [emp.id, today, lat, lng, distanceM, method, status, detail, selfie || null]
     );
 
     res.json({
