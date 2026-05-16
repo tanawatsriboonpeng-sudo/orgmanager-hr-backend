@@ -134,6 +134,23 @@ async function ensureSchema() {
       ALTER TABLE employees
       ADD COLUMN IF NOT EXISTS weekly_shifts JSONB DEFAULT '{}'::jsonb
     `);
+    // Position tree (โครงสร้างตำแหน่ง). Self-referential. Each row is one
+    // position title (e.g. "ผู้จัดการ") with a code (e.g. "M0001") and an
+    // optional parent. Frontend renders as a tree.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS positions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        code VARCHAR(50) UNIQUE,
+        name VARCHAR(200) NOT NULL,
+        description TEXT,
+        parent_id UUID REFERENCES positions(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_positions_parent ON positions(parent_id)
+    `);
     console.log('🔧 schema check ok');
   } catch (e) {
     console.error('⚠️  schema check failed:', e.message);

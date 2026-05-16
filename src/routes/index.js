@@ -141,6 +141,92 @@ router.patch('/employees/me', authenticate, async (req, res) => {
   }
 });
 
+// ====== POSITIONS (โครงสร้างตำแหน่ง) ======
+// Self-referential hierarchical structure of job titles.
+router.get('/positions', authenticate, async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT id, code, name, description, parent_id, created_at
+       FROM positions
+       ORDER BY parent_id NULLS FIRST, code, name`
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (e) {
+    console.error('GET /positions error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.post('/positions', authenticate, authorize('hr', 'owner'), async (req, res) => {
+  const { code, name, description, parentId } = req.body;
+  if (!name || !name.trim()) {
+    return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อตำแหน่ง' });
+  }
+  // Auto-generate code if missing: POS001, POS002, ...
+  let finalCode = code?.trim() || null;
+  if (!finalCode) {
+    try {
+      const seq = await query(`SELECT COUNT(*)::int AS n FROM positions`);
+      finalCode = `POS${String((seq.rows[0].n || 0) + 1).padStart(5, '0')}`;
+    } catch { finalCode = null; }
+  }
+  try {
+    const r = await query(
+      `INSERT INTO positions (code, name, description, parent_id)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [finalCode, name.trim(), description || null, parentId || null]
+    );
+    res.status(201).json({ success: true, message: 'สร้างตำแหน่งแล้ว', data: r.rows[0] });
+  } catch (err) {
+    if (err.code === '23505') return res.status(400).json({ success: false, message: 'มีโค้ดตำแหน่งนี้อยู่แล้ว' });
+    console.error('POST /positions error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.patch('/positions/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
+  const { code, name, description, parentId } = req.body;
+  // Prevent assigning self as parent
+  if (parentId === req.params.id) {
+    return res.status(400).json({ success: false, message: 'ไม่สามารถตั้งตำแหน่งตัวเองเป็น parent ได้' });
+  }
+  try {
+    await query(
+      `UPDATE positions SET
+         code = COALESCE($1, code),
+         name = COALESCE($2, name),
+         description = COALESCE($3, description),
+         parent_id = $4,
+         updated_at = NOW()
+       WHERE id = $5`,
+      [code, name, description, parentId === '' ? null : parentId, req.params.id]
+    );
+    res.json({ success: true, message: 'อัปเดตตำแหน่งแล้ว' });
+  } catch (err) {
+    if (err.code === '23505') return res.status(400).json({ success: false, message: 'มีโค้ดตำแหน่งนี้อยู่แล้ว' });
+    console.error('PATCH /positions/:id error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.delete('/positions/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
+  try {
+    // Block delete if it has children
+    const kids = await query('SELECT COUNT(*)::int as n FROM positions WHERE parent_id = $1', [req.params.id]);
+    if (kids.rows[0].n > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `ลบไม่ได้ มีตำแหน่งย่อย ${kids.rows[0].n} ตำแหน่ง — กรุณาลบหรือย้ายออกก่อน`
+      });
+    }
+    await query('DELETE FROM positions WHERE id = $1', [req.params.id]);
+    res.json({ success: true, message: 'ลบตำแหน่งแล้ว' });
+  } catch (e) {
+    console.error('DELETE /positions/:id error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
 // ====== SHIFT CONFIGS (rules) ======
 // Defines the rules for each shift type: work hours, late/absent
 // thresholds, and (for flex shifts) the staggered tier table.
