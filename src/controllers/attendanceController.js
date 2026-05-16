@@ -162,20 +162,21 @@ const checkIn = async (req, res) => {
     if (isDayOff) {
       return res.status(400).json({ success: false, message: 'วันนี้เป็นวันหยุดของคุณ ไม่ต้องลงเวลา' });
     }
-    const { status, detail } = calcStatus(now, shiftCfg);
+    const { status, detail, almostLate } = calcStatus(now, shiftCfg);
 
     // บันทึก
     const result = await query(
       `INSERT INTO attendance_logs
-        (employee_id, date, check_in_at, check_in_lat, check_in_lng, check_in_distance_m, check_in_method, status, status_detail, check_in_selfie)
-       VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7, $8, $9)
+        (employee_id, date, check_in_at, check_in_lat, check_in_lng, check_in_distance_m, check_in_method, status, status_detail, check_in_selfie, almost_late)
+       VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7, $8, $9, $10)
        ON CONFLICT (employee_id, date) DO UPDATE SET
         check_in_at = NOW(), check_in_lat = $3, check_in_lng = $4,
         check_in_distance_m = $5, check_in_method = $6, status = $7, status_detail = $8,
         check_in_selfie = COALESCE($9, attendance_logs.check_in_selfie),
+        almost_late = $10,
         updated_at = NOW()
        RETURNING *`,
-      [emp.id, today, lat, lng, distanceM, method, status, detail, selfie || null]
+      [emp.id, today, lat, lng, distanceM, method, status, detail, selfie || null, !!almostLate]
     );
 
     res.json({
@@ -297,10 +298,14 @@ const getDailySummary = async (req, res) => {
     ]);
 
     const totalEmp = parseInt(total.rows[0].count);
-    const present = logs.rows.filter(r => r.status === 'present').length;
-    const late = logs.rows.filter(r => r.status === 'late').length;
-    const absent = logs.rows.filter(r => r.status === 'absent').length;
-    const onLeave = logs.rows.filter(r => r.status === 'leave').length;
+    // Note: present is the total green-bucket count (includes almost_late
+    // rows). almostLate is broken out as its own number so the UI can show
+    // it as a separate 5th bucket without double-counting.
+    const present    = logs.rows.filter(r => r.status === 'present').length;
+    const almostLate = logs.rows.filter(r => r.status === 'present' && r.almost_late).length;
+    const late       = logs.rows.filter(r => r.status === 'late').length;
+    const absent     = logs.rows.filter(r => r.status === 'absent').length;
+    const onLeave    = logs.rows.filter(r => r.status === 'leave').length;
 
     res.json({
       success: true,
@@ -309,6 +314,7 @@ const getDailySummary = async (req, res) => {
         summary: {
           total: totalEmp,
           present,
+          almostLate,
           late,
           absent,
           leave: onLeave,
@@ -346,11 +352,12 @@ const getRecentSummary = async (req, res) => {
 
     const result = await query(
       `SELECT date::text AS d,
-              COUNT(*) FILTER (WHERE status = 'present')::int   AS present,
-              COUNT(*) FILTER (WHERE status = 'late')::int      AS late,
-              COUNT(*) FILTER (WHERE status = 'absent')::int    AS absent,
-              COUNT(*) FILTER (WHERE status = 'leave')::int     AS leave,
-              COUNT(*) FILTER (WHERE status = 'very_late')::int AS very_late
+              COUNT(*) FILTER (WHERE status = 'present' AND NOT almost_late)::int AS present,
+              COUNT(*) FILTER (WHERE status = 'present' AND almost_late)::int     AS almost_late,
+              COUNT(*) FILTER (WHERE status = 'late')::int                        AS late,
+              COUNT(*) FILTER (WHERE status = 'absent')::int                      AS absent,
+              COUNT(*) FILTER (WHERE status = 'leave')::int                       AS leave,
+              COUNT(*) FILTER (WHERE status = 'very_late')::int                   AS very_late
        FROM attendance_logs
        WHERE date BETWEEN $1 AND $2
        GROUP BY date`,
@@ -364,12 +371,13 @@ const getRecentSummary = async (req, res) => {
     const DAY_TH = ['อา', 'จ', 'อ', 'พ', 'พฤ', 'ศ', 'ส'];
     const rows = dates.map(d => {
       const dow = dayjs(d).day();
-      const row = byDate[d] || { present: 0, late: 0, absent: 0, leave: 0, very_late: 0 };
+      const row = byDate[d] || { present: 0, almost_late: 0, late: 0, absent: 0, leave: 0, very_late: 0 };
       return {
         date: d,
         day: DAY_TH[dow],
-        present: row.present,
-        late: row.late + row.very_late, // collapse very_late into late
+        present: row.present,                       // ตรงเวลาเป๊ะ (not almost_late)
+        almost_late: row.almost_late,               // เกือบสาย — own bar so dashboard can show it
+        late: row.late + row.very_late,             // collapse very_late into late
         absent: row.absent,
         leave: row.leave,
       };
@@ -399,11 +407,12 @@ const getMyHistory = async (req, res) => {
     );
 
     const summary = {
-      present: result.rows.filter(r => r.status === 'present').length,
-      late: result.rows.filter(r => r.status === 'late').length,
-      absent: result.rows.filter(r => r.status === 'absent').length,
+      present:    result.rows.filter(r => r.status === 'present').length,
+      almostLate: result.rows.filter(r => r.status === 'present' && r.almost_late).length,
+      late:       result.rows.filter(r => r.status === 'late').length,
+      absent:     result.rows.filter(r => r.status === 'absent').length,
       totalWorkHours: result.rows.reduce((s, r) => s + (parseFloat(r.work_hours) || 0), 0).toFixed(1),
-      totalOtHours: result.rows.reduce((s, r) => s + (parseFloat(r.ot_hours) || 0), 0).toFixed(1),
+      totalOtHours:   result.rows.reduce((s, r) => s + (parseFloat(r.ot_hours)   || 0), 0).toFixed(1),
     };
 
     res.json({ success: true, data: { summary, records: result.rows } });

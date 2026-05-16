@@ -252,6 +252,26 @@ async function ensureSchema() {
       ALTER TABLE attendance_logs
       ADD COLUMN IF NOT EXISTS check_in_selfie TEXT
     `);
+    // "เกือบสาย" tracked as a first-class flag rather than only being
+    // visible via status_detail string matching. Keeps the status enum
+    // unchanged (present/late/absent/leave) — almost_late=true just
+    // refines a 'present' row into the warning bucket. Counts on
+    // /daily-summary, /recent-summary, and /my-history use this column
+    // so the summaries can surface a 5th bucket without parsing text.
+    await client.query(`
+      ALTER TABLE attendance_logs
+      ADD COLUMN IF NOT EXISTS almost_late BOOLEAN DEFAULT false
+    `);
+    // One-time backfill from the existing status_detail text. Idempotent
+    // because it only writes rows where almost_late is still the default
+    // false and the detail matches the legacy phrase.
+    await client.query(`
+      UPDATE attendance_logs
+         SET almost_late = true
+       WHERE almost_late = false
+         AND status = 'present'
+         AND status_detail = 'เกือบสาย'
+    `);
     // Payroll. Legacy DBs created before migrate.js added payroll_records
     // won't have this table, so create it defensively on every boot.
     // net_salary is a GENERATED column — Postgres recomputes it on every
