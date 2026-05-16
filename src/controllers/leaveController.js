@@ -50,6 +50,12 @@ const getMyQuota = async (req, res) => {
 
 // POST /api/leave/request
 const createRequest = async (req, res) => {
+  // Mirrors the attendance/OT owner blocks — the owner has no quota and
+  // no one to approve them, so they shouldn't be filing requests. Frontend
+  // hides the form, but the API is the source of truth.
+  if (req.user?.role === 'owner') {
+    return res.status(403).json({ success: false, message: 'เจ้าของไม่ต้องยื่นลา' });
+  }
   try {
     const { leaveTypeId, startDate, endDate, reason } = req.body;
     if (!leaveTypeId || !startDate || !endDate || !reason) {
