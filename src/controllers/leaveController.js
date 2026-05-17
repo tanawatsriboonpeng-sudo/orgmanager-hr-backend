@@ -58,6 +58,40 @@ const getMyQuota = async (req, res) => {
 const getAllQuotas = async (req, res) => {
   try {
     const year = parseInt(req.query.year, 10) || dayjs().year();
+    // Lazy bootstrap: if the requested year is the current year and the
+    // table is empty (brand-new install / just rolled over to the new
+    // year), auto-seed so HR doesn't have to remember to click a button.
+    // Past/future years are intentionally NOT auto-seeded — creating
+    // quotas for arbitrary years from a GET could surprise HR.
+    if (year === dayjs().year()) {
+      const probe = await query(
+        `SELECT 1
+           FROM leave_quotas lq
+           JOIN employees e ON lq.employee_id = e.id
+           LEFT JOIN users u ON e.user_id = u.id
+          WHERE lq.year = $1
+            AND e.is_active = true
+            AND (u.role IS NULL OR u.role <> 'owner')
+          LIMIT 1`,
+        [year]
+      );
+      if (probe.rows.length === 0) {
+        await query(
+          `INSERT INTO leave_quotas (employee_id, leave_type_id, year, total_days, used_days)
+           SELECT e.id, lt.id, $1, lt.days_per_year, 0
+             FROM employees e
+             JOIN users u ON e.user_id = u.id
+            CROSS JOIN leave_types lt
+            WHERE e.is_active = true
+              AND u.role <> 'owner'
+              AND lt.is_active = true
+              AND lt.days_per_year > 0
+           ON CONFLICT (employee_id, leave_type_id, year) DO NOTHING`,
+          [year]
+        ).catch(err => console.error('[leave] lazy seed in getAllQuotas failed:', err.message));
+      }
+    }
+
     // Compute remaining_days inline instead of relying on the GENERATED
     // STORED column — legacy prod DBs were seeded before that column
     // landed in migrate.js and would 500 here otherwise. The arithmetic
