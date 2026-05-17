@@ -14,6 +14,15 @@ router.post('/auth/refresh', authCtrl.refreshToken);
 router.post('/auth/logout', authenticate, authCtrl.logout);
 router.post('/auth/change-password', authenticate, authCtrl.changePassword);
 router.get('/auth/me', authenticate, authCtrl.getMe);
+// LINE Login (LIFF integration). line-login is the entry point — verifies
+// the LINE access token against our channel and either issues JWTs (when
+// the LINE userId is already linked) or returns a 404+code so the
+// frontend can prompt for email+password to link. line-link is the
+// "already logged in, want to attach LINE" path; line-unlink is the
+// reverse.
+router.post('/auth/line-login',  authCtrl.lineLogin);
+router.post('/auth/line-link',   authenticate, authCtrl.lineLink);
+router.post('/auth/line-unlink', authenticate, authCtrl.lineUnlink);
 
 // ====== ATTENDANCE ======
 // Owners do not check in. Block at the API layer so any client (web, mobile)
@@ -2944,6 +2953,120 @@ router.post('/cleaning/sessions/:id/reject', authenticate, authorize('hr', 'owne
     res.json({ success: true, message: 'ตีกลับแล้ว' });
   } catch (e) {
     console.error('POST /cleaning/sessions/:id/reject error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// ====== OFFICE LOCATIONS ======
+// Owner-managed list of allowed GPS check-in spots. Anyone authenticated
+// can read (the attendance UI may want to show which spots are valid);
+// only the owner can mutate. Backend attendance check-in iterates this
+// list and allows the entry if any active location matches its own
+// radius. Falls back to env vars when the table is empty so a fresh
+// install still works.
+router.get('/office-locations', authenticate, async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT id, name, lat::float AS lat, lng::float AS lng,
+              radius_meters, is_active, created_at, updated_at
+         FROM office_locations
+        ORDER BY is_active DESC, name`
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (e) {
+    console.error('GET /office-locations error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+function validateLocPayload(body) {
+  const name = String(body.name || '').trim();
+  const lat = Number(body.lat);
+  const lng = Number(body.lng);
+  const radius = Math.round(Number(body.radiusMeters));
+  if (!name)                                   return 'กรุณาระบุชื่อสถานที่';
+  if (name.length > 100)                       return 'ชื่อสถานที่ยาวเกินไป (สูงสุด 100 ตัว)';
+  if (!Number.isFinite(lat) || lat < -90 || lat > 90)        return 'พิกัด latitude ไม่ถูกต้อง';
+  if (!Number.isFinite(lng) || lng < -180 || lng > 180)      return 'พิกัด longitude ไม่ถูกต้อง';
+  if (!Number.isFinite(radius) || radius < 10 || radius > 5000) return 'รัศมีต้องอยู่ในช่วง 10–5000 เมตร';
+  return null;
+}
+
+router.post('/office-locations', authenticate, authorize('owner'),
+  auditLog('office_location_create', 'office_locations'),
+  async (req, res) => {
+  const err = validateLocPayload(req.body);
+  if (err) return res.status(400).json({ success: false, message: err });
+  try {
+    const r = await query(
+      `INSERT INTO office_locations (name, lat, lng, radius_meters, is_active)
+       VALUES ($1, $2, $3, $4, COALESCE($5, true)) RETURNING *`,
+      [String(req.body.name).trim(), Number(req.body.lat), Number(req.body.lng),
+       Math.round(Number(req.body.radiusMeters)),
+       typeof req.body.isActive === 'boolean' ? req.body.isActive : null]
+    );
+    res.status(201).json({ success: true, data: r.rows[0] });
+  } catch (e) {
+    console.error('POST /office-locations error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.patch('/office-locations/:id', authenticate, authorize('owner'),
+  auditLog('office_location_update', 'office_locations'),
+  async (req, res) => {
+  const { name, lat, lng, radiusMeters, isActive } = req.body;
+  // Partial update: validate only fields present.
+  if (lat !== undefined) {
+    const n = Number(lat);
+    if (!Number.isFinite(n) || n < -90 || n > 90) {
+      return res.status(400).json({ success: false, message: 'พิกัด latitude ไม่ถูกต้อง' });
+    }
+  }
+  if (lng !== undefined) {
+    const n = Number(lng);
+    if (!Number.isFinite(n) || n < -180 || n > 180) {
+      return res.status(400).json({ success: false, message: 'พิกัด longitude ไม่ถูกต้อง' });
+    }
+  }
+  if (radiusMeters !== undefined) {
+    const n = Math.round(Number(radiusMeters));
+    if (!Number.isFinite(n) || n < 10 || n > 5000) {
+      return res.status(400).json({ success: false, message: 'รัศมีต้องอยู่ในช่วง 10–5000 เมตร' });
+    }
+  }
+  try {
+    await query(
+      `UPDATE office_locations SET
+         name          = COALESCE($1, name),
+         lat           = COALESCE($2, lat),
+         lng           = COALESCE($3, lng),
+         radius_meters = COALESCE($4, radius_meters),
+         is_active     = COALESCE($5, is_active),
+         updated_at    = NOW()
+       WHERE id = $6`,
+      [name ? String(name).trim() : null,
+       lat !== undefined ? Number(lat) : null,
+       lng !== undefined ? Number(lng) : null,
+       radiusMeters !== undefined ? Math.round(Number(radiusMeters)) : null,
+       typeof isActive === 'boolean' ? isActive : null,
+       req.params.id]
+    );
+    res.json({ success: true, message: 'อัปเดตแล้ว' });
+  } catch (e) {
+    console.error('PATCH /office-locations/:id error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.delete('/office-locations/:id', authenticate, authorize('owner'),
+  auditLog('office_location_delete', 'office_locations'),
+  async (req, res) => {
+  try {
+    await query('DELETE FROM office_locations WHERE id = $1', [req.params.id]);
+    res.json({ success: true, message: 'ลบแล้ว' });
+  } catch (e) {
+    console.error('DELETE /office-locations/:id error:', e.message);
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
 });
