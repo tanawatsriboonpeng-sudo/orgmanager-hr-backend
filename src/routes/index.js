@@ -2755,7 +2755,7 @@ router.patch('/cleaning/sessions/:id/inspector', authenticate, authorize('hr', '
       type: 'cleaning_inspector_assigned',
       title: 'คุณได้รับมอบหมายเป็นผู้ตรวจรอบทำความสะอาด',
       body: 'กรุณาตรวจและกรอกชื่อคนทำเมื่อเสร็จ',
-      link: '/cleaning',
+      link: `/cleaning?session=${req.params.id}`,
       relatedId: req.params.id,
     });
     res.json({ success: true, message: 'เปลี่ยนผู้ตรวจแล้ว' });
@@ -2819,7 +2819,7 @@ router.post('/cleaning/sessions/:id/inspect', authenticate,
       type: 'cleaning_review_pending',
       title: 'ผู้ตรวจรายงานรอบทำความสะอาดแล้ว',
       body: `วันที่ ${session.session_date} รอ HR/เจ้าของอนุมัติ`,
-      link: '/cleaning',
+      link: `/cleaning?session=${req.params.id}`,
       relatedId: req.params.id,
     });
     res.json({ success: true, message: 'ส่งรายงานแล้ว รอ HR/เจ้าของอนุมัติ' });
@@ -2879,7 +2879,7 @@ router.post('/cleaning/sessions/:id/approve', authenticate, authorize('hr', 'own
         type: 'cleaning_approved',
         title: 'รอบทำความสะอาดได้รับอนุมัติ',
         body: `วันที่ ${session.session_date}${hrNotes ? ' · ' + hrNotes : ''}`,
-        link: '/cleaning',
+        link: `/cleaning?session=${req.params.id}`,
         relatedId: req.params.id,
       });
     }
@@ -2914,7 +2914,7 @@ router.post('/cleaning/sessions/:id/reject', authenticate, authorize('hr', 'owne
         type: 'cleaning_rejected',
         title: 'รอบทำความสะอาดถูกตีกลับ',
         body: hrNotes ? `เหตุผล: ${hrNotes}` : 'กรุณาแก้ไขและส่งใหม่',
-        link: '/cleaning',
+        link: `/cleaning?session=${req.params.id}`,
         relatedId: req.params.id,
       });
     }
