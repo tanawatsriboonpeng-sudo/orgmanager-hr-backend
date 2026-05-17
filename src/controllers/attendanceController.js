@@ -605,7 +605,262 @@ const getMyHistory = async (req, res) => {
   }
 };
 
+/* ===== Backdated check-in / check-out requests ===== */
+// Employee forgot to tap เช็คอิน/เช็คเอาท์ on a past day → submits a
+// request with the actual time + reason. Kept in its own table so the
+// audit trail is preserved even after HR's approval writes the
+// attendance_logs row.
+
+// POST /api/attendance/backdate-request
+const createBackdateRequest = async (req, res) => {
+  if (req.user?.role === 'owner') {
+    return res.status(403).json({ success: false, message: 'เจ้าของไม่ต้องยื่นคำขอลงเวลา' });
+  }
+  const { date, requestType, checkInTime, checkOutTime, reason } = req.body;
+  if (!date || !requestType || !reason || !String(reason).trim()) {
+    return res.status(400).json({ success: false, message: 'กรุณาระบุวันที่ ประเภท และเหตุผล' });
+  }
+  if (!['check_in', 'check_out', 'both'].includes(requestType)) {
+    return res.status(400).json({ success: false, message: 'ประเภทคำขอไม่ถูกต้อง' });
+  }
+  // Each request_type needs its corresponding time field. Validation here
+  // saves a noisy approval failure later when HR tries to apply it.
+  if ((requestType === 'check_in' || requestType === 'both') && !checkInTime) {
+    return res.status(400).json({ success: false, message: 'กรุณาระบุเวลาเข้างาน' });
+  }
+  if ((requestType === 'check_out' || requestType === 'both') && !checkOutTime) {
+    return res.status(400).json({ success: false, message: 'กรุณาระบุเวลาออกงาน' });
+  }
+  // Sanity: can't submit a request for a future date.
+  if (dayjs(date).isAfter(nowLocal(), 'day')) {
+    return res.status(400).json({ success: false, message: 'ไม่สามารถยื่นย้อนหลังในวันอนาคตได้' });
+  }
+  try {
+    const emp = await query('SELECT id, first_name, last_name FROM employees WHERE user_id = $1', [req.user.id]);
+    if (!emp.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลพนักงาน' });
+    const empRow = emp.rows[0];
+
+    const r = await query(
+      `INSERT INTO attendance_backdate_requests
+         (employee_id, date, request_type, check_in_time, check_out_time, reason)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [empRow.id, date, requestType,
+       requestType === 'check_out' ? null : (checkInTime  || null),
+       requestType === 'check_in'  ? null : (checkOutTime || null),
+       String(reason).trim()]
+    );
+
+    // Notify everyone who can approve. The body packs the date + the
+    // first 60 chars of the reason so the bell row reads naturally.
+    const typeTxt = requestType === 'both'        ? 'เข้า+ออกงาน'
+                  : requestType === 'check_in'    ? 'เข้างาน'
+                  :                                  'ออกงาน';
+    notifyManyByRole(['hr', 'owner'], {
+      type: 'attendance_backdate_pending',
+      title: `คำขอลงเวลาย้อนหลัง (${typeTxt}) จาก ${empRow.first_name} ${empRow.last_name}`,
+      body: `วันที่ ${dayjs(date).format('D MMM')} · เหตุผล: ${String(reason).trim().slice(0, 60)}`,
+      link: '/attendance',
+      relatedId: r.rows[0].id,
+    });
+
+    res.status(201).json({ success: true, message: 'ส่งคำขอลงเวลาย้อนหลังแล้ว รอ HR/เจ้าของอนุมัติ', data: r.rows[0] });
+  } catch (err) {
+    console.error('POST /attendance/backdate-request error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
+// GET /api/attendance/backdate-pending (HR/owner)
+const getBackdatePending = async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT br.*,
+              e.first_name, e.last_name, e.nickname, e.avatar_url,
+              e.employee_id AS emp_code, e.position,
+              d.name AS department_name
+         FROM attendance_backdate_requests br
+         JOIN employees e ON br.employee_id = e.id
+         LEFT JOIN departments d ON e.department_id = d.id
+        WHERE br.status = 'pending'
+        ORDER BY br.created_at ASC`
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    console.error('GET /attendance/backdate-pending error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
+// GET /api/attendance/backdate-mine — employee sees their own history
+const getMyBackdateRequests = async (req, res) => {
+  try {
+    const emp = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
+    if (!emp.rows[0]) return res.json({ success: true, data: [] });
+    const r = await query(
+      `SELECT * FROM attendance_backdate_requests
+        WHERE employee_id = $1
+        ORDER BY created_at DESC
+        LIMIT 50`,
+      [emp.rows[0].id]
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    console.error('GET /attendance/backdate-mine error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
+// POST /api/attendance/backdate/:id/approve — HR/owner approves.
+// Applies the request to attendance_logs: insert or update the (employee,
+// date) row to reflect the requested check_in_at / check_out_at. Status
+// is recomputed via calcStatus so the bucket matches what would have
+// happened if they'd checked in on time.
+const approveBackdate = async (req, res) => {
+  try {
+    const reqRow = await query(
+      `SELECT br.*, e.id AS emp_id
+         FROM attendance_backdate_requests br
+         JOIN employees e ON br.employee_id = e.id
+        WHERE br.id = $1 AND br.status = 'pending'`,
+      [req.params.id]
+    );
+    if (!reqRow.rows[0]) {
+      return res.status(400).json({ success: false, message: 'อนุมัติได้เฉพาะคำขอที่รออนุมัติ' });
+    }
+    const br = reqRow.rows[0];
+    const date = dayjs(br.date).format('YYYY-MM-DD');
+
+    // Build absolute timestamps from the date + TIME components.
+    const stamp = (t) => t ? dayjs.tz(`${date}T${String(t).slice(0,8)}`, TZ).toISOString() : null;
+    const wantCheckIn  = (br.request_type === 'check_in' || br.request_type === 'both');
+    const wantCheckOut = (br.request_type === 'check_out' || br.request_type === 'both');
+    const newCheckInAt  = wantCheckIn  ? stamp(br.check_in_time)  : null;
+    const newCheckOutAt = wantCheckOut ? stamp(br.check_out_time) : null;
+
+    // Recompute status if we're (re)setting check-in. Use the shift
+    // resolver for that date so the bucket matches the employee's
+    // schedule.
+    let newStatus = null, newDetail = null, newAlmostLate = null;
+    if (wantCheckIn) {
+      const { config: shiftCfg } = await resolveShiftConfig(br.emp_id, date);
+      const checkInAsDay = dayjs.tz(`${date}T${String(br.check_in_time).slice(0,8)}`, TZ);
+      const calc = calcStatus(checkInAsDay, shiftCfg);
+      newStatus = calc.status; newDetail = calc.detail; newAlmostLate = calc.almostLate;
+    }
+
+    // Work hours from check-in → check-out, when both are now present.
+    // The CASE in SQL covers the case where only one side is provided
+    // and the existing row had the other; we recompute work_hours.
+    let workHours = null, otHours = null;
+    if (wantCheckOut) {
+      // Need check-in to compute. Use the request's check_in_time when
+      // provided, otherwise read the existing row's check_in_at.
+      let checkIn;
+      if (wantCheckIn) checkIn = dayjs.tz(`${date}T${String(br.check_in_time).slice(0,8)}`, TZ);
+      else {
+        const existing = await query(
+          'SELECT check_in_at FROM attendance_logs WHERE employee_id = $1 AND date = $2',
+          [br.emp_id, date]
+        );
+        if (existing.rows[0]?.check_in_at) checkIn = dayjs(existing.rows[0].check_in_at);
+      }
+      if (checkIn) {
+        const checkOut = dayjs.tz(`${date}T${String(br.check_out_time).slice(0,8)}`, TZ);
+        const minutes = checkOut.diff(checkIn, 'minute');
+        if (minutes > 0) {
+          workHours = parseFloat((minutes / 60).toFixed(2));
+          otHours = workHours > 8 ? parseFloat((workHours - 8).toFixed(2)) : 0;
+        }
+      }
+    }
+
+    // Apply to attendance_logs. ON CONFLICT updates the existing row;
+    // COALESCE keeps fields we didn't touch (so a check-out-only approval
+    // doesn't clobber the existing check-in).
+    await query(
+      `INSERT INTO attendance_logs
+         (employee_id, date, check_in_at, check_out_at, status, status_detail, almost_late, work_hours, ot_hours, check_in_method)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'manual')
+       ON CONFLICT (employee_id, date) DO UPDATE SET
+         check_in_at  = COALESCE($3, attendance_logs.check_in_at),
+         check_out_at = COALESCE($4, attendance_logs.check_out_at),
+         status        = COALESCE($5, attendance_logs.status),
+         status_detail = COALESCE($6, attendance_logs.status_detail),
+         almost_late   = COALESCE($7, attendance_logs.almost_late),
+         work_hours    = COALESCE($8, attendance_logs.work_hours),
+         ot_hours      = COALESCE($9, attendance_logs.ot_hours),
+         updated_at    = NOW()`,
+      [br.emp_id, date, newCheckInAt, newCheckOutAt,
+       newStatus, newDetail, newAlmostLate, workHours, otHours]
+    );
+
+    await query(
+      `UPDATE attendance_backdate_requests
+          SET status = 'approved', reviewed_by = $1, reviewed_at = NOW(), updated_at = NOW()
+        WHERE id = $2`,
+      [req.user.id, req.params.id]
+    );
+
+    // Notify the employee.
+    const empUserId = await userIdFromEmployee(br.emp_id);
+    const typeTxt = br.request_type === 'both'     ? 'เข้า+ออกงาน'
+                  : br.request_type === 'check_in' ? 'เข้างาน'
+                  :                                   'ออกงาน';
+    notify(empUserId, {
+      type: 'attendance_backdate_approved',
+      title: `อนุมัติคำขอลงเวลาย้อนหลัง (${typeTxt})`,
+      body: `วันที่ ${dayjs(date).format('D MMM')}`,
+      link: '/attendance',
+      relatedId: br.id,
+    });
+
+    res.json({ success: true, message: 'อนุมัติคำขอแล้ว' });
+  } catch (err) {
+    console.error('POST /attendance/backdate/:id/approve error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
+// POST /api/attendance/backdate/:id/reject — HR/owner rejects with an
+// optional reason. attendance_logs is not touched.
+const rejectBackdate = async (req, res) => {
+  try {
+    const reason = req.body?.reason ? String(req.body.reason).trim() : null;
+    const r = await query(
+      `UPDATE attendance_backdate_requests
+          SET status = 'rejected', reviewed_by = $1, reviewed_at = NOW(),
+              reject_reason = $2, updated_at = NOW()
+        WHERE id = $3 AND status = 'pending'
+        RETURNING id, employee_id, date, request_type`,
+      [req.user.id, reason, req.params.id]
+    );
+    if (!r.rows[0]) {
+      return res.status(400).json({ success: false, message: 'ปฏิเสธได้เฉพาะคำขอที่รออนุมัติ' });
+    }
+    const row = r.rows[0];
+    const empUserId = await userIdFromEmployee(row.employee_id);
+    const typeTxt = row.request_type === 'both'     ? 'เข้า+ออกงาน'
+                  : row.request_type === 'check_in' ? 'เข้างาน'
+                  :                                    'ออกงาน';
+    const bodyParts = [`วันที่ ${dayjs(row.date).format('D MMM')}`];
+    if (reason) bodyParts.push(`หมายเหตุ: ${reason}`);
+    notify(empUserId, {
+      type: 'attendance_backdate_rejected',
+      title: `ไม่อนุมัติคำขอลงเวลาย้อนหลัง (${typeTxt})`,
+      body: bodyParts.join(' · '),
+      link: '/attendance',
+      relatedId: row.id,
+    });
+    res.json({ success: true, message: 'ปฏิเสธคำขอแล้ว' });
+  } catch (err) {
+    console.error('POST /attendance/backdate/:id/reject error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
 module.exports = {
   checkIn, checkOut, getToday, getDailySummary, getMyHistory, getRecentSummary,
   getOffsitePending, approveOffsite, rejectOffsite,
+  createBackdateRequest, getBackdatePending, getMyBackdateRequests,
+  approveBackdate, rejectBackdate,
 };

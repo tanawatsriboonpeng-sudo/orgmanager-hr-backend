@@ -33,6 +33,12 @@ router.get('/attendance/recent-summary', authenticate, authorize('owner', 'hr'),
 router.get('/attendance/offsite-pending',     authenticate, authorize('owner', 'hr'), attendCtrl.getOffsitePending);
 router.post('/attendance/offsite/:id/approve', authenticate, authorize('owner', 'hr'), auditLog('offsite_approve', 'attendance_logs'), attendCtrl.approveOffsite);
 router.post('/attendance/offsite/:id/reject',  authenticate, authorize('owner', 'hr'), auditLog('offsite_reject',  'attendance_logs'), attendCtrl.rejectOffsite);
+// Backdated check-in/check-out requests
+router.post('/attendance/backdate-request',     authenticate,                            attendCtrl.createBackdateRequest);
+router.get('/attendance/backdate-mine',         authenticate,                            attendCtrl.getMyBackdateRequests);
+router.get('/attendance/backdate-pending',      authenticate, authorize('owner', 'hr'), attendCtrl.getBackdatePending);
+router.post('/attendance/backdate/:id/approve', authenticate, authorize('owner', 'hr'), auditLog('backdate_approve', 'attendance_backdate_requests'), attendCtrl.approveBackdate);
+router.post('/attendance/backdate/:id/reject',  authenticate, authorize('owner', 'hr'), auditLog('backdate_reject',  'attendance_backdate_requests'), attendCtrl.rejectBackdate);
 
 // ====== LEAVE ======
 router.get('/leave/types', authenticate, leaveCtrl.getLeaveTypes);

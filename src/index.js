@@ -320,6 +320,37 @@ async function ensureSchema() {
          AND status = 'present'
          AND status_detail = 'เกือบสาย'
     `);
+    // Backdated check-in/check-out requests: an employee submits a fix
+    // for a past day they forgot to log (forgot to tap เช็คอิน, or left
+    // without เช็คเอาท์). Each row is one request; HR/owner approves
+    // (which then writes/updates the actual attendance_logs row for
+    // that date) or rejects with a reason. Kept in its own table so
+    // the historical request audit survives even after the attendance
+    // row gets recomputed.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS attendance_backdate_requests (
+        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        employee_id     UUID REFERENCES employees(id) ON DELETE CASCADE,
+        date            DATE NOT NULL,
+        request_type    VARCHAR(20) NOT NULL CHECK (request_type IN ('check_in','check_out','both')),
+        check_in_time   TIME,
+        check_out_time  TIME,
+        reason          TEXT NOT NULL,
+        status          VARCHAR(20) NOT NULL DEFAULT 'pending'
+                          CHECK (status IN ('pending','approved','rejected')),
+        reviewed_by     UUID REFERENCES users(id),
+        reviewed_at     TIMESTAMPTZ,
+        reject_reason   TEXT,
+        created_at      TIMESTAMPTZ DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_backdate_status ON attendance_backdate_requests(status, date DESC)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_backdate_employee ON attendance_backdate_requests(employee_id, created_at DESC)
+    `);
     // Off-site check-in: lets a field/remote employee log a check-in
     // outside the company GPS radius with a reason; HR/owner approves
     // before it counts as a real attendance entry. is_offsite=true rows
