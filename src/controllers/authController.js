@@ -1,6 +1,7 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { query } = require('../../config/database');
+const { runPurgeIfDue } = require('./retentionController');
 
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCK_DURATION_MINUTES = 30;
@@ -205,6 +206,10 @@ const getMe = async (req, res) => {
       [req.user.id]
     );
     const u = result.rows[0];
+    // Piggyback lazy daily auto-purge here. Fire-and-forget — the cost
+    // is one SELECT on org_settings unless we're actually due, and the
+    // user shouldn't wait for /me on the rare day it actually runs.
+    runPurgeIfDue().catch(() => {});
     res.json({ success: true, data: { ...u, fullName: u ? `${u.first_name} ${u.last_name}` : null } });
   } catch (err) {
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });

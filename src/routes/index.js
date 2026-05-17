@@ -4,6 +4,7 @@ const { authenticate, authorize, auditLog } = require('../middleware/auth');
 const authCtrl = require('../controllers/authController');
 const attendCtrl = require('../controllers/attendanceController');
 const leaveCtrl = require('../controllers/leaveController');
+const retentionCtrl = require('../controllers/retentionController');
 const { query, pool } = require('../../config/database');
 const { notify, notifyManyByRole, userIdFromEmployee } = require('../middleware/notify');
 const dayjsForNotif = require('dayjs');
@@ -1471,6 +1472,22 @@ router.patch('/org-settings', authenticate, authorize('owner'),
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
 });
+
+// ====== DATA RETENTION ======
+// Read by HR/owner (HR can see policy too so they know what to expect);
+// only owner can mutate. Manual purge is owner-only — it's a destructive
+// op (binary blobs gone for good) so we keep the trigger surface tight.
+router.get('/admin/retention',
+  authenticate, authorize('hr', 'owner'),
+  retentionCtrl.getRetention);
+router.patch('/admin/retention',
+  authenticate, authorize('owner'),
+  auditLog('retention_policy_update', 'org_settings'),
+  retentionCtrl.updateRetention);
+router.post('/admin/purge-old-data',
+  authenticate, authorize('owner'),
+  auditLog('manual_purge', 'org_settings'),
+  retentionCtrl.purgeNow);
 
 // ====== PAYROLL ======
 // payroll_records is the master table of monthly slips. One row per

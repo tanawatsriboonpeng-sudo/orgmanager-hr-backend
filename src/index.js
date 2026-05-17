@@ -478,6 +478,24 @@ async function ensureSchema() {
     await client.query(`
       INSERT INTO org_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING
     `);
+    // Data retention policy. We don't drop the row, only the heavy binary
+    // blobs (selfies, attachments) on attendance_logs / backdate requests;
+    // notifications + audit_logs do get row-deleted because their core
+    // value IS the row itself. Owner can tune these from /settings.
+    //
+    // last_purge_summary keeps a JSON snapshot of the last run for the UI
+    // ("ล้างไป N รูป รวม N MB เมื่อ ...") without us having to expose a
+    // separate history table.
+    await client.query(`
+      ALTER TABLE org_settings
+      ADD COLUMN IF NOT EXISTS retention_selfie_days       INT          DEFAULT 180,
+      ADD COLUMN IF NOT EXISTS retention_attachment_days   INT          DEFAULT 365,
+      ADD COLUMN IF NOT EXISTS retention_notification_days INT          DEFAULT 90,
+      ADD COLUMN IF NOT EXISTS retention_audit_days        INT          DEFAULT 730,
+      ADD COLUMN IF NOT EXISTS retention_auto_purge        BOOLEAN      DEFAULT true,
+      ADD COLUMN IF NOT EXISTS last_purge_at               TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS last_purge_summary          JSONB
+    `);
     // KPI tables — defensive in case prod DB predates migrate.js.
     // criteria: weighted rubric items. weight is a relative number (no need
     // to sum to 100); the review-overall formula divides by the sum of the
