@@ -440,8 +440,14 @@ const getDailySummary = async (req, res) => {
           leave: onLeave,
           rejected: rejected.length,
           // rejected rows are treated as if the employee never checked in
-          notCheckedIn: totalEmp - counted.length,
-          attendanceRate: parseFloat(((present + late) / totalEmp * 100).toFixed(1))
+          notCheckedIn: Math.max(0, totalEmp - counted.length),
+          // Guard divide-by-zero — a brand-new install with zero active
+          // employees would otherwise return NaN here, which the
+          // dashboard renders as "NaN%". Returning 0 keeps the
+          // progress bar empty cleanly.
+          attendanceRate: totalEmp > 0
+            ? parseFloat(((present + late) / totalEmp * 100).toFixed(1))
+            : 0
         },
         records: counted,
         rejectedRecords: rejected,
@@ -793,6 +799,27 @@ const approveBackdate = async (req, res) => {
     const newCheckInAt  = wantCheckIn  ? stamp(br.check_in_time)  : null;
     const newCheckOutAt = wantCheckOut ? stamp(br.check_out_time) : null;
 
+    // Guard: a check-out-only approval can't create a fresh row, because
+    // there'd be no check_in_at to anchor it against. Force-check that an
+    // attendance_logs row for this (employee, date) already exists. If
+    // not, surface the error to HR so they decide between asking the
+    // employee to resubmit as 'both' or rejecting outright. Without
+    // this, the INSERT path would happily write a row with
+    // check_in_at=NULL + check_out_at=stamp — broken data that breaks
+    // work_hours math and the daily summary.
+    if (!wantCheckIn) {
+      const existingRow = await query(
+        'SELECT check_in_at FROM attendance_logs WHERE employee_id = $1 AND date = $2',
+        [br.emp_id, date]
+      );
+      if (!existingRow.rows[0]?.check_in_at) {
+        return res.status(400).json({
+          success: false,
+          message: 'ไม่มีข้อมูลเข้างานในวันนี้ — ขอให้พนักงานยื่นคำขอใหม่แบบ "เข้า+ออกงาน"',
+        });
+      }
+    }
+
     // Recompute status if we're (re)setting check-in. Use the shift
     // resolver for that date so the bucket matches the employee's
     // schedule.
@@ -833,10 +860,16 @@ const approveBackdate = async (req, res) => {
     // Apply to attendance_logs. ON CONFLICT updates the existing row;
     // COALESCE keeps fields we didn't touch (so a check-out-only approval
     // doesn't clobber the existing check-in).
+    //
+    // missing_checkout flag is force-cleared: HR just gave the row a real
+    // check-out time, so the "you forgot to tap" banner shouldn't keep
+    // showing. Without this, sweepMissingCheckouts' half-day work_hours
+    // estimate is overwritten correctly via COALESCE but the boolean
+    // sticks around — confusing the UI.
     await query(
       `INSERT INTO attendance_logs
-         (employee_id, date, check_in_at, check_out_at, status, status_detail, almost_late, work_hours, ot_hours, check_in_method)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'manual')
+         (employee_id, date, check_in_at, check_out_at, status, status_detail, almost_late, work_hours, ot_hours, check_in_method, missing_checkout)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'manual', false)
        ON CONFLICT (employee_id, date) DO UPDATE SET
          check_in_at  = COALESCE($3, attendance_logs.check_in_at),
          check_out_at = COALESCE($4, attendance_logs.check_out_at),
@@ -845,6 +878,7 @@ const approveBackdate = async (req, res) => {
          almost_late   = COALESCE($7, attendance_logs.almost_late),
          work_hours    = COALESCE($8, attendance_logs.work_hours),
          ot_hours      = COALESCE($9, attendance_logs.ot_hours),
+         missing_checkout = false,
          updated_at    = NOW()`,
       [br.emp_id, date, newCheckInAt, newCheckOutAt,
        newStatus, newDetail, newAlmostLate, workHours, otHours]
@@ -929,7 +963,10 @@ const adminRecord = async (req, res) => {
   if (!checkInTime && !checkOutTime) {
     return res.status(400).json({ success: false, message: 'กรุณาระบุเวลาเข้าหรือออกอย่างน้อย 1 อย่าง' });
   }
-  if (dayjs(date).isAfter(nowLocal(), 'day')) {
+  // Both sides anchored to TZ. A bare dayjs(date) parses as UTC, so
+  // between UTC midnight and 07:00 BKK the picker's "today" would be
+  // wrongly classified as the future and rejected.
+  if (dayjs.tz(date, TZ).isAfter(nowLocal(), 'day')) {
     return res.status(400).json({ success: false, message: 'ไม่สามารถลงเวลาในวันอนาคตได้' });
   }
   try {
