@@ -518,6 +518,28 @@ async function ensureSchema() {
       ALTER TABLE leave_requests
       ADD COLUMN IF NOT EXISTS document TEXT
     `);
+    // leave_types columns added after the initial migrate.js cut. Prod
+    // DBs seeded before these landed have rows with no column → the
+    // settings UI shows "undefined" until we self-heal.
+    await client.query(`
+      ALTER TABLE leave_types
+      ADD COLUMN IF NOT EXISTS advance_notice_days INT     DEFAULT 1,
+      ADD COLUMN IF NOT EXISTS carry_over_days     INT     DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS requires_document   BOOLEAN DEFAULT false
+    `);
+    // Backfill existing NULLs to the column defaults — ADD COLUMN with
+    // DEFAULT only fills new rows on some Postgres versions/managed
+    // setups, so be explicit. NULL → 1 day notice / 0 carryover / no
+    // document required, all matching the per-column DEFAULT above.
+    await client.query(`
+      UPDATE leave_types SET
+        advance_notice_days = COALESCE(advance_notice_days, 1),
+        carry_over_days     = COALESCE(carry_over_days, 0),
+        requires_document   = COALESCE(requires_document, false)
+      WHERE advance_notice_days IS NULL
+         OR carry_over_days     IS NULL
+         OR requires_document   IS NULL
+    `);
     // KPI tables — defensive in case prod DB predates migrate.js.
     // criteria: weighted rubric items. weight is a relative number (no need
     // to sum to 100); the review-overall formula divides by the sum of the
