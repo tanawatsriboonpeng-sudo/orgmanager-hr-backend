@@ -1314,16 +1314,30 @@ router.patch('/employees/:id/toggle-active', authenticate, authorize('owner'),
   auditLog('employee_toggle_active', 'employees'),
   async (req,res) => {
   try {
-    const e = await query('SELECT user_id,is_active FROM employees WHERE id=$1',[req.params.id])
+    const e = await query('SELECT e.user_id, e.is_active, u.role AS target_role FROM employees e LEFT JOIN users u ON e.user_id = u.id WHERE e.id=$1',[req.params.id])
     if(!e.rows[0]) return res.status(404).json({success:false,message:'ไม่พบพนักงาน'})
-    const active = !e.rows[0].is_active
+    const target = e.rows[0]
+    const active = !target.is_active
+
+    // Guard 1: owner cannot suspend their own account (would lock self out)
+    if (target.user_id === req.user.id) {
+      return res.status(400).json({ success: false, message: 'ระงับบัญชีตัวเองไม่ได้' })
+    }
+    // Guard 2: never leave the system without an active owner
+    if (!active && target.target_role === 'owner') {
+      const c = await query("SELECT COUNT(*)::int AS n FROM users WHERE role='owner' AND is_active=true")
+      if ((c.rows[0]?.n || 0) <= 1) {
+        return res.status(400).json({ success: false, message: 'ระบบต้องมี owner อย่างน้อย 1 คน' })
+      }
+    }
+
     await query('UPDATE employees SET is_active=$1 WHERE id=$2',[active,req.params.id])
-    await query('UPDATE users SET is_active=$1 WHERE id=$2',[active,e.rows[0].user_id])
+    await query('UPDATE users SET is_active=$1 WHERE id=$2',[active,target.user_id])
 
     // Tell the affected user. When disabling they'll get this in the
     // bell on their next login attempt (assuming they ever come back);
     // when re-enabling it's reassuring confirmation.
-    notify(e.rows[0].user_id, {
+    notify(target.user_id, {
       type: active ? 'account_enabled' : 'account_disabled',
       title: active ? 'บัญชีของคุณถูกเปิดใช้งานอีกครั้ง' : 'บัญชีของคุณถูกระงับ',
       body: active ? null : 'หากต้องการสอบถาม กรุณาติดต่อ HR หรือเจ้าของบริษัท',
