@@ -8,6 +8,18 @@
 // All retention windows live on org_settings (singleton row id=1) so the
 // owner can tune them from /settings without a redeploy.
 const { query } = require('../../config/database');
+const dayjs = require('dayjs');
+const utc = require('dayjs/plugin/utc');
+const timezone = require('dayjs/plugin/timezone');
+dayjs.extend(utc);
+dayjs.extend(timezone);
+const TZ = process.env.APP_TIMEZONE || 'Asia/Bangkok';
+// Bangkok-anchored YYYY-MM-DD. Used to gate runPurgeIfDue so the daily
+// window flips at local midnight (00:00 BKK), not UTC midnight — which
+// would otherwise mean the purge could run twice in the 17:00–07:00
+// UTC window (once before, once after UTC day rollover, both still
+// being the same Bangkok day).
+const bkkDay = (d = new Date()) => dayjs(d).tz(TZ).format('YYYY-MM-DD');
 
 // Cheap shared cache so /me-style endpoints can poll runPurgeIfDue()
 // without each one running the full purge in parallel. The actual write
@@ -195,14 +207,12 @@ async function runPurgeIfDue() {
     try {
       const policy = await readPolicy();
       if (!policy.retention_auto_purge) return null;
-      // "Due" = either never purged, or last purge was on an earlier
-      // calendar day in Asia/Bangkok. We compare in UTC since both
-      // sides are TIMESTAMPTZ — the day boundary is close enough.
-      if (policy.last_purge_at) {
-        const last = new Date(policy.last_purge_at);
-        const lastDay = Math.floor(last.getTime() / 86_400_000);
-        const today = Math.floor(Date.now() / 86_400_000);
-        if (lastDay === today) return null;
+      // "Due" = never purged OR last purge was on an earlier Bangkok
+      // calendar day. Comparing YYYY-MM-DD strings is robust against
+      // DST (n/a in Thailand but defensive) and against UTC day
+      // boundaries falling mid-Bangkok-day.
+      if (policy.last_purge_at && bkkDay(policy.last_purge_at) === bkkDay()) {
+        return null;
       }
       return await purgeOnce();
     } catch (e) {

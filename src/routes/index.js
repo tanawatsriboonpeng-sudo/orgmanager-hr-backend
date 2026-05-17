@@ -8,6 +8,14 @@ const retentionCtrl = require('../controllers/retentionController');
 const { query, pool } = require('../../config/database');
 const { notify, notifyManyByRole, userIdFromEmployee } = require('../middleware/notify');
 const dayjsForNotif = require('dayjs');
+// Used by cleaning DOW resolution + any other route that needs a
+// Bangkok-anchored timestamp. Render runs UTC; plain dayjs() picks
+// that up and misreports the day for late-evening Bangkok requests.
+const dayjsUtc = require('dayjs/plugin/utc');
+const dayjsTz  = require('dayjs/plugin/timezone');
+dayjsForNotif.extend(dayjsUtc);
+dayjsForNotif.extend(dayjsTz);
+const APP_TZ = process.env.APP_TIMEZONE || 'Asia/Bangkok';
 
 // ====== AUTH ======
 router.post('/auth/login', authCtrl.login);
@@ -99,6 +107,11 @@ router.post('/leave/admin-record',
   auditLog('leave_admin_record', 'leave_requests'),
   leaveCtrl.adminCreateLeave);
 router.post('/leave/:id/cancel', authenticate, leaveCtrl.cancelRequest);
+// HR/owner: void an already-approved leave (refunds quota + removes
+// attendance rows + notifies employee — all in one transaction).
+router.post('/leave/:id/cancel-approved', authenticate, authorize('hr', 'owner'),
+  auditLog('leave_cancel_approved', 'leave_requests'),
+  leaveCtrl.cancelApproved);
 router.get('/leave/pending', authenticate, authorize('hr', 'owner'), leaveCtrl.getPending);
 // Owner included for the single-owner-no-HR case; if the company has HR
 // staff they'll usually approve, but owner is the failsafe approver.
@@ -1389,22 +1402,38 @@ router.patch('/employees/:id', authenticate, authorize('hr','owner'),
 
 // Bulk update weekly_shifts — used by the recurring "ตารางรายสัปดาห์"
 // grid. Each item: { employeeId, weeklyShifts: { "0": "WC001"|"dayoff", ... } }
+//
+// Old shape: loop and run one UPDATE per employee — N round-trips for
+// a 50-employee save (often the entire team in one click). Rewritten
+// as a single UPDATE … FROM unnest($1::uuid[], $2::jsonb[]) so the
+// whole batch is one statement regardless of N. Backwards-compat:
+// the request body shape is unchanged.
 router.post('/employees/weekly-shifts/bulk', authenticate, authorize('hr','owner'), async (req, res) => {
   const { items } = req.body
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ success: false, message: 'ไม่มีข้อมูล' })
   }
+  // Filter to well-formed entries up-front. Garbage rows are dropped
+  // silently — the count in the response tells HR what got applied.
+  const valid = items.filter(it =>
+    it && it.employeeId
+    && typeof it.weeklyShifts === 'object' && it.weeklyShifts !== null
+  )
+  if (valid.length === 0) {
+    return res.json({ success: true, message: 'ไม่มีรายการที่ถูกต้อง', data: { updated: 0 } })
+  }
   try {
-    let updated = 0
-    for (const it of items) {
-      if (!it.employeeId || typeof it.weeklyShifts !== 'object' || it.weeklyShifts === null) continue
-      await query(
-        'UPDATE employees SET weekly_shifts = $1::jsonb, updated_at = NOW() WHERE id = $2',
-        [JSON.stringify(it.weeklyShifts), it.employeeId]
-      )
-      updated++
-    }
-    res.json({ success: true, message: `บันทึก ${updated} คน`, data: { updated } })
+    const ids = valid.map(v => v.employeeId)
+    const jsons = valid.map(v => JSON.stringify(v.weeklyShifts))
+    const r = await query(
+      `UPDATE employees AS e
+          SET weekly_shifts = src.ws::jsonb,
+              updated_at    = NOW()
+         FROM unnest($1::uuid[], $2::text[]) AS src(eid, ws)
+        WHERE e.id = src.eid`,
+      [ids, jsons]
+    )
+    res.json({ success: true, message: `บันทึก ${r.rowCount} คน`, data: { updated: r.rowCount } })
   } catch (e) {
     console.error('POST /employees/weekly-shifts/bulk error:', e.message)
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' })
@@ -1413,22 +1442,38 @@ router.post('/employees/weekly-shifts/bulk', authenticate, authorize('hr','owner
 
 // Bulk update work_days for many employees at once — used by the
 // "วันทำงาน/วันหยุด" grid which lets HR change several rows then save once.
+// Same N+1 → single-statement rewrite as /weekly-shifts/bulk above.
 router.post('/employees/work-days/bulk', authenticate, authorize('hr','owner'), async (req, res) => {
   const { items } = req.body
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ success: false, message: 'ไม่มีข้อมูล' })
   }
+  const valid = items.filter(it => it && it.employeeId && Array.isArray(it.workDays))
+  if (valid.length === 0) {
+    return res.json({ success: true, message: 'ไม่มีรายการที่ถูกต้อง', data: { updated: 0 } })
+  }
   try {
-    let updated = 0
-    for (const it of items) {
-      if (!it.employeeId || !Array.isArray(it.workDays)) continue
-      await query(
-        'UPDATE employees SET work_days = $1, updated_at = NOW() WHERE id = $2',
-        [it.workDays, it.employeeId]
-      )
-      updated++
-    }
-    res.json({ success: true, message: `บันทึก ${updated} รายการ`, data: { updated } })
+    const ids = valid.map(v => v.employeeId)
+    // Each workDays becomes a Postgres int-array literal like `{0,1,2,3,4}`.
+    // We sanitize each element to a finite integer (DOW 0–6, so anything
+    // wider is a bug). Casting `text::int[]` in the SQL converts the
+    // literal back into a native array. unnest with nested arrays of
+    // arrays isn't ergonomic in pg, so we lean on the literal form.
+    const wdLiterals = valid.map(v => {
+      const ints = v.workDays
+        .map(n => Number.parseInt(n, 10))
+        .filter(n => Number.isFinite(n) && n >= 0 && n <= 6)
+      return `{${ints.join(',')}}`
+    })
+    const r = await query(
+      `UPDATE employees AS e
+          SET work_days  = src.wd::int[],
+              updated_at = NOW()
+         FROM unnest($1::uuid[], $2::text[]) AS src(eid, wd)
+        WHERE e.id = src.eid`,
+      [ids, wdLiterals]
+    )
+    res.json({ success: true, message: `บันทึก ${r.rowCount} รายการ`, data: { updated: r.rowCount } })
   } catch (e) {
     console.error('POST /employees/work-days/bulk error:', e.message)
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' })
@@ -1890,7 +1935,13 @@ router.post('/payroll/bulk-generate', authenticate, authorize('hr', 'owner'),
   }
   const m = parseInt(month, 10);
   const y = parseInt(year, 10);
-  if (m < 1 || m > 12 || y < 2000 || y > 2200) {
+  // Tighten the year range: the wide 2000–2200 ceiling was too
+  // permissive (a typo'd 2199 would silently succeed and generate
+  // empty slips). Constrain to "within a few years of now" — payroll
+  // batches predate the system by at most a couple of years for
+  // backfills, and run ahead by at most one for budgeting.
+  const thisYear = new Date().getUTCFullYear();
+  if (m < 1 || m > 12 || y < thisYear - 5 || y > thisYear + 1) {
     return res.status(400).json({ success: false, message: 'เดือนหรือปีไม่ถูกต้อง' });
   }
   // Period bounds (inclusive). Use first/last day of the month.
@@ -2838,7 +2889,11 @@ async function pickNextInspector(client) {
 router.get('/cleaning/today', authenticate, async (req, res) => {
   try {
     const today = bangkokDateISO();
-    const dow = new Date(today + 'T00:00:00').getDay(); // 0..6
+    // `new Date('YYYY-MM-DDT00:00:00').getDay()` parses in **server**
+    // local TZ — on Render (UTC) that gives the wrong DOW for any
+    // Bangkok date during the 17:00–24:00 UTC window of the prior day.
+    // Anchor to Asia/Bangkok via dayjs+timezone for the right answer.
+    const dow = dayjsForNotif.tz(today, APP_TZ).day(); // 0..6, Sun..Sat
     const settingsRes = await query('SELECT * FROM cleaning_settings WHERE id = 1');
     const s = settingsRes.rows[0];
     if (!s || !s.is_active || !Array.isArray(s.weekdays) || !s.weekdays.includes(dow)) {

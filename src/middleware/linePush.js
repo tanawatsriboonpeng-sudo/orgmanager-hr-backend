@@ -21,9 +21,27 @@ async function pushTextTo(lineUserId, text, options = {}) {
   const token = process.env.LINE_OA_CHANNEL_TOKEN;
   if (!token) return { skipped: 'no-token' };
   if (!lineUserId || !text) return { skipped: 'missing-args' };
-  // LINE rejects messages > 5000 chars. Trim with a marker so the
-  // recipient knows it was cut.
-  const body = text.length > 4900 ? `${text.slice(0, 4900)}\n…(ตัดข้อความ)` : text;
+  // LINE caps messages at 5000 UTF-16 code units. JavaScript `.length`
+  // happens to count UTF-16 code units too, BUT a single emoji like 🎉
+  // is 2 code units while taking 1 visual position — meaning a string
+  // full of emoji + the truncation marker can still overshoot if we
+  // budget the marker as if it were 1 unit. Convert to an array of
+  // code points to do the cut, then re-join, and reserve enough
+  // budget for the marker in code units.
+  const MAX_UNITS = 5000;
+  const MARKER = '\n…(ตัดข้อความ)';
+  const markerUnits = MARKER.length;          // ~13 UTF-16 units
+  const budget = MAX_UNITS - markerUnits;
+  let body = text;
+  if (text.length > MAX_UNITS) {
+    // Slice on a surrogate-pair boundary: if the cut would land
+    // mid-emoji, back off one position so we don't ship a lone
+    // high surrogate.
+    let end = budget;
+    const code = text.charCodeAt(end - 1);
+    if (code >= 0xD800 && code <= 0xDBFF) end -= 1;
+    body = text.slice(0, end) + MARKER;
+  }
   const messages = [{ type: 'text', text: body }];
   // Optional quick-reply button to deep-link back into the LIFF app for
   // this notification. We use a uri action so tapping opens the

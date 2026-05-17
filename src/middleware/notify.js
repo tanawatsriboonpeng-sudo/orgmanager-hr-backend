@@ -42,6 +42,30 @@ async function notify(userId, { type, title, body, link, relatedId } = {}) {
   }
 }
 
+// Cap how many notify() calls run in parallel from a single fan-out.
+// Each notify() opens 2 DB connections (INSERT + SELECT) plus an
+// outbound LINE push, so a 20-person HR broadcast under the old
+// Promise.all(...) was 40+ parallel pool checkouts and 20 parallel
+// LINE requests — easy to exhaust Render free tier's small pool and
+// trip LINE's rate limit. 5 in flight at a time keeps the burst
+// manageable while still finishing a 50-person broadcast in ~10s.
+const FANOUT_CONCURRENCY = 5;
+
+// Tiny in-file pLimit-style runner — avoids adding a dependency for
+// what's effectively three lines of logic. Returns a Promise that
+// resolves once every task has settled (mirrors Promise.allSettled
+// semantics so one slow user doesn't block the rest).
+async function runWithConcurrency(tasks, limit) {
+  let i = 0;
+  const workers = Array.from({ length: Math.min(limit, tasks.length) }, async () => {
+    while (i < tasks.length) {
+      const idx = i++;
+      try { await tasks[idx](); } catch { /* notify swallows already */ }
+    }
+  });
+  await Promise.all(workers);
+}
+
 // Fan-out: notify every active user whose role is in `roles`.
 // Used for "broadcast to all HR + owner" kind of events (e.g. an
 // employee just filed a leave request — everyone who can approve it
@@ -53,7 +77,10 @@ async function notifyManyByRole(roles, payload) {
       `SELECT id FROM users WHERE role = ANY($1::varchar[]) AND is_active = true`,
       [roles]
     );
-    await Promise.all(r.rows.map(u => notify(u.id, payload)));
+    await runWithConcurrency(
+      r.rows.map(u => () => notify(u.id, payload)),
+      FANOUT_CONCURRENCY
+    );
   } catch (err) {
     console.error(`[notify] role broadcast failed (${roles.join(',')}):`, err.message);
   }
