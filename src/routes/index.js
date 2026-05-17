@@ -309,6 +309,7 @@ router.get('/employees', authenticate, authorize('hr', 'owner'), async (req, res
               e.department_id, e.manager_id, e.user_id,
               e.hire_date, e.start_date,
               e.shift_type, e.phone,
+              e.work_days, e.weekly_shifts,
               e.is_active, e.base_salary,
               u.email, u.role, u.is_active as account_active, u.last_login_at,
               d.name as department_name,
