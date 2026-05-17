@@ -815,6 +815,41 @@ async function ensureSchema() {
       ALTER TABLE cleaning_session_items
       ADD COLUMN IF NOT EXISTS not_done BOOLEAN DEFAULT false
     `);
+    // ====== SUPPORT TICKETS ======
+    // Two-way help channel: any employee opens a ticket (bug / help /
+    // feature / hr / other), HR + owner respond. status flow:
+    //   open      → just submitted
+    //   answered  → HR/owner posted a response (still re-openable)
+    //   closed    → conversation ended (either side can close)
+    // Single-response model — the response field is overwritten on
+    // re-respond, simpler than a threaded comments table and matches
+    // how the user described the feature ("ticket + reply"). attachment
+    // is the same base64 dataURL pattern leave/payroll already use.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS support_tickets (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        employee_id UUID REFERENCES employees(id) ON DELETE SET NULL,
+        category VARCHAR(20) NOT NULL,
+        subject VARCHAR(200) NOT NULL,
+        description TEXT NOT NULL,
+        attachment TEXT,
+        status VARCHAR(20) NOT NULL DEFAULT 'open',
+        hr_response TEXT,
+        responded_by UUID REFERENCES users(id) ON DELETE SET NULL,
+        responded_at TIMESTAMPTZ,
+        closed_at TIMESTAMPTZ,
+        closed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_support_tickets_user ON support_tickets(user_id, created_at DESC)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON support_tickets(status, created_at DESC)
+    `);
     console.log('🔧 schema check ok');
   } catch (e) {
     console.error('⚠️  schema check failed:', e.message);

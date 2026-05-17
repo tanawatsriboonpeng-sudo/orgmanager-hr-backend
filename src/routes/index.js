@@ -5,6 +5,7 @@ const authCtrl = require('../controllers/authController');
 const attendCtrl = require('../controllers/attendanceController');
 const leaveCtrl = require('../controllers/leaveController');
 const retentionCtrl = require('../controllers/retentionController');
+const supportCtrl = require('../controllers/supportController');
 const { query, pool } = require('../../config/database');
 const { notify, notifyManyByRole, userIdFromEmployee } = require('../middleware/notify');
 const dayjsForNotif = require('dayjs');
@@ -3876,5 +3877,23 @@ router.delete('/office-locations/:id', authenticate, authorize('owner'),
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
 });
+
+// ====== SUPPORT TICKETS ======
+// Two-way help channel — see supportController.js for full details.
+// Employee opens a ticket; HR/owner responds and resolves.
+router.get('/support/tickets', authenticate, supportCtrl.list);
+router.get('/support/tickets/:id', authenticate, supportCtrl.getOne);
+router.post('/support/tickets', authenticate,
+  auditLog('support_ticket_create', 'support_tickets'),
+  supportCtrl.create);
+router.post('/support/tickets/:id/respond', authenticate, authorize('hr', 'owner'),
+  auditLog('support_ticket_respond', 'support_tickets'),
+  supportCtrl.respond);
+router.post('/support/tickets/:id/close', authenticate,
+  auditLog('support_ticket_close', 'support_tickets'),
+  supportCtrl.close);
+router.post('/support/tickets/:id/reopen', authenticate,
+  auditLog('support_ticket_reopen', 'support_tickets'),
+  supportCtrl.reopen);
 
 module.exports = router;
