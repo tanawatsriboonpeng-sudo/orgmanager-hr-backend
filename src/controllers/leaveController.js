@@ -63,6 +63,7 @@ const getAllQuotas = async (req, res) => {
               lq.total_days, lq.used_days, lq.remaining_days,
               e.first_name, e.last_name, e.nickname, e.avatar_url,
               e.employee_id AS emp_code, e.position,
+              e.start_date, e.hire_date, e.is_active AS emp_is_active,
               d.name AS department_name,
               lt.name AS leave_type_name, lt.code AS leave_type_code
          FROM leave_quotas lq
