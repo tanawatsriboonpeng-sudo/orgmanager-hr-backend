@@ -323,20 +323,25 @@ const checkOut = async (req, res) => {
     const checkInAt = dayjs(log.rows[0].check_in_at);
     const checkOutAt = nowLocal();
     const workHours = parseFloat((checkOutAt.diff(checkInAt, 'minute') / 60).toFixed(2));
-    const otHours = workHours > 8 ? parseFloat((workHours - 8).toFixed(2)) : 0;
 
+    // OT is NOT auto-counted from "stayed past 8 hours". The source of
+    // truth for OT is /ot/request rows that HR has approved — coming in
+    // early or leaving late doesn't earn OT on its own. Force ot_hours
+    // to 0 here so payroll never accidentally double-counts (payroll/
+    // bulk-generate already SUMs from ot_requests, so a stale positive
+    // here would just be UI noise — but better to keep the field honest).
     await query(
       `UPDATE attendance_logs SET
         check_out_at = NOW(), check_out_lat = $1, check_out_lng = $2,
-        work_hours = $3, ot_hours = $4, updated_at = NOW()
-       WHERE employee_id = $5 AND date = $6`,
-      [lat, lng, workHours, otHours, empId, today]
+        work_hours = $3, ot_hours = 0, updated_at = NOW()
+       WHERE employee_id = $4 AND date = $5`,
+      [lat, lng, workHours, empId, today]
     );
 
     res.json({
       success: true,
       message: 'เช็คเอาท์สำเร็จ',
-      data: { checkOutAt: checkOutAt.toISOString(), workHours, otHours }
+      data: { checkOutAt: checkOutAt.toISOString(), workHours, otHours: 0 }
     });
   } catch (err) {
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
@@ -633,15 +638,32 @@ const getMyHistory = async (req, res) => {
     const { month, year } = req.query;
     const empResult = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
     if (!empResult.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลพนักงาน' });
+    const empId = empResult.rows[0].id;
+    const m = month || nowLocal().month() + 1;
+    const y = year || nowLocal().year();
 
-    const result = await query(
-      `SELECT * FROM attendance_logs
-       WHERE employee_id = $1
-         AND EXTRACT(MONTH FROM date) = $2
-         AND EXTRACT(YEAR FROM date) = $3
-       ORDER BY date DESC`,
-      [empResult.rows[0].id, month || nowLocal().month() + 1, year || nowLocal().year()]
-    );
+    // Pull attendance + approved OT in parallel. OT is the source-of-
+    // truth column on ot_requests, not attendance_logs.ot_hours (which
+    // is now always 0 per the "auto OT removed" policy).
+    const [result, otRes] = await Promise.all([
+      query(
+        `SELECT * FROM attendance_logs
+         WHERE employee_id = $1
+           AND EXTRACT(MONTH FROM date) = $2
+           AND EXTRACT(YEAR FROM date) = $3
+         ORDER BY date DESC`,
+        [empId, m, y]
+      ),
+      query(
+        `SELECT COALESCE(SUM(hours), 0)::float AS hours, COUNT(*)::int AS request_count
+           FROM ot_requests
+          WHERE employee_id = $1
+            AND status = 'hr_approved'
+            AND EXTRACT(MONTH FROM date) = $2
+            AND EXTRACT(YEAR FROM date) = $3`,
+        [empId, m, y]
+      ),
+    ]);
 
     // Rejected off-site requests don't contribute to the personal totals;
     // the rows stay in `records` so the employee can still see them with
@@ -652,8 +674,14 @@ const getMyHistory = async (req, res) => {
       almostLate: counted.filter(r => r.status === 'present' && r.almost_late).length,
       late:       counted.filter(r => r.status === 'late').length,
       absent:     counted.filter(r => r.status === 'absent').length,
+      // Leave count was missing — the summary now reflects all four
+      // attendance buckets the UI shows.
+      leave:      counted.filter(r => r.status === 'leave').length,
       totalWorkHours: counted.reduce((s, r) => s + (parseFloat(r.work_hours) || 0), 0).toFixed(1),
-      totalOtHours:   counted.reduce((s, r) => s + (parseFloat(r.ot_hours)   || 0), 0).toFixed(1),
+      // OT total comes from approved /ot/request rows in this month.
+      // attendance_logs.ot_hours is never auto-populated anymore.
+      totalOtHours:    (otRes.rows[0]?.hours || 0).toFixed(1),
+      otRequestCount:  otRes.rows[0]?.request_count || 0,
     };
 
     res.json({ success: true, data: { summary, records: result.rows } });
@@ -832,9 +860,10 @@ const approveBackdate = async (req, res) => {
     }
 
     // Work hours from check-in → check-out, when both are now present.
-    // The CASE in SQL covers the case where only one side is provided
-    // and the existing row had the other; we recompute work_hours.
-    let workHours = null, otHours = null;
+    // ot_hours stays 0 — see the policy note in checkOut. OT only counts
+    // when there's an approved /ot/request row.
+    let workHours = null;
+    const otHours = wantCheckOut ? 0 : null;
     if (wantCheckOut) {
       // Need check-in to compute. Use the request's check_in_time when
       // provided, otherwise read the existing row's check_in_at.
@@ -852,7 +881,6 @@ const approveBackdate = async (req, res) => {
         const minutes = checkOut.diff(checkIn, 'minute');
         if (minutes > 0) {
           workHours = parseFloat((minutes / 60).toFixed(2));
-          otHours = workHours > 8 ? parseFloat((workHours - 8).toFixed(2)) : 0;
         }
       }
     }
@@ -991,10 +1019,10 @@ const adminRecord = async (req, res) => {
       newStatus = calc.status; newDetail = calc.detail; newAlmostLate = calc.almostLate;
     }
 
-    // Recompute work_hours / ot_hours when both ends are known. If only
-    // a check-out is being added to an existing row, pull the existing
-    // check-in to do the math.
-    let workHours = null, otHours = null;
+    // Recompute work_hours when both ends are known. ot_hours stays 0 —
+    // see the policy note in checkOut. OT is only earned via /ot/request.
+    let workHours = null;
+    const otHours = checkOutTime ? 0 : null;
     if (checkOutTime) {
       let checkIn;
       if (checkInTime) checkIn = dayjs.tz(`${date}T${String(checkInTime).slice(0,8)}`, TZ);
@@ -1010,7 +1038,6 @@ const adminRecord = async (req, res) => {
         const minutes = checkOut.diff(checkIn, 'minute');
         if (minutes > 0) {
           workHours = parseFloat((minutes / 60).toFixed(2));
-          otHours = workHours > 8 ? parseFloat((workHours - 8).toFixed(2)) : 0;
         }
       }
     }

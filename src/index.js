@@ -369,6 +369,22 @@ async function ensureSchema() {
       ALTER TABLE attendance_logs
       ADD COLUMN IF NOT EXISTS missing_checkout BOOLEAN DEFAULT false
     `);
+    // One-time cleanup: older rows had ot_hours auto-calculated as
+    // (work_hours - 8) whenever an employee stayed past 8 hours, which
+    // was the wrong policy (OT only counts via /ot/request that HR
+    // approved). Zero those out so my-history's totalOtHours and
+    // anything else summing the column reflect reality. Idempotent —
+    // future runs find no positive rows because checkOut/approveBackdate/
+    // adminRecord now write 0 explicitly.
+    await client.query(`
+      UPDATE attendance_logs
+         SET ot_hours = 0
+       WHERE ot_hours IS NOT NULL AND ot_hours > 0
+    `).catch(err => {
+      // Don't fail boot if the column is missing on a really old DB —
+      // ALTER below would add it; nothing to clean up yet.
+      console.warn('[ensureSchema] ot_hours cleanup skipped:', err.message);
+    });
     // Admin-record provenance: when HR/owner uses the "ลงเวลาให้
     // พนักงาน" button to write a row on someone else's behalf, stamp
     // who did it + an optional note so the audit trail shows the row
