@@ -909,7 +909,17 @@ router.post('/holidays', authenticate, authorize('hr', 'owner'), async (req, res
     res.status(201).json({ success: true, data: r.rows[0] });
   } catch (e) {
     console.error('POST /holidays error:', e.code, e.message);
-    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+    // Translate the most common Postgres errors into actionable messages
+    // — way more useful than a blanket "เกิดข้อผิดพลาด" when triaging
+    // legacy-schema issues from the UI.
+    const msg =
+      e.code === '23505' ? 'วันที่นี้มีวันหยุดอยู่แล้ว' :
+      e.code === '23514' ? `ค่า type ไม่ตรงกับที่ระบบรองรับ (${e.constraint || ''})` :
+      e.code === '23503' ? 'อ้างอิงพนักงานไม่พบ (created_by FK)' :
+      e.code === '42703' ? `คอลัมน์หายไปใน DB: ${e.message}` :
+      e.code === '42P01' ? 'ตาราง holidays ยังไม่มีใน DB' :
+      `เกิดข้อผิดพลาด: ${e.message || 'ไม่ทราบสาเหตุ'}`;
+    res.status(500).json({ success: false, message: msg, code: e.code || null });
   }
 });
 

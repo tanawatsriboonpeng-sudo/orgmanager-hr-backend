@@ -511,6 +511,31 @@ async function ensureSchema() {
         UNIQUE(date)
       )
     `);
+    // Defensive ALTERs for prod DBs that pre-date the columns above —
+    // CREATE TABLE IF NOT EXISTS doesn't backfill missing columns into
+    // an existing table. Without these, POST /holidays from the new
+    // UI 500s with "column does not exist" on old schemas.
+    await client.query(`
+      ALTER TABLE holidays
+        ADD COLUMN IF NOT EXISTS year INT,
+        ADD COLUMN IF NOT EXISTS created_by UUID REFERENCES users(id),
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()
+    `);
+    // Backfill `year` from `date` for any pre-existing rows so the GET
+    // /holidays?year= filter doesn't miss them.
+    await client.query(
+      `UPDATE holidays SET year = EXTRACT(YEAR FROM date)::int WHERE year IS NULL`
+    ).catch(() => { /* table empty or year already set everywhere */ });
+    // Some old schemas had `name` NOT NULL with a smaller varchar — make
+    // sure the column is wide enough for full holiday names.
+    await client.query(`
+      DO $$ BEGIN
+        BEGIN
+          ALTER TABLE holidays ALTER COLUMN name TYPE VARCHAR(200);
+        EXCEPTION WHEN others THEN NULL;
+        END;
+      END $$;
+    `);
 
     // Calendar events — owner/HR-managed meetings, seminars, company
     // milestones. Distinct from `holidays` (which is the public/company
