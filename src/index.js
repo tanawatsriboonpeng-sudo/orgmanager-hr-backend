@@ -238,6 +238,25 @@ async function ensureSchema() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `);
+    // Legacy prod DBs had an older audit_logs schema with fewer columns —
+    // CREATE TABLE IF NOT EXISTS above doesn't help when the table is
+    // already there. Render logs were screaming
+    //   "column 'resource_id' of relation 'audit_logs' does not exist"
+    // on every INSERT. Defensively ADD each post-creation column so the
+    // middleware's INSERT (which writes resource_id, details, ip_address,
+    // device_info) succeeds even on a partially-migrated table.
+    const auditColumns = [
+      ['resource',    'VARCHAR(100)'],
+      ['resource_id', 'VARCHAR(100)'],
+      ['details',     'JSONB'],
+      ['ip_address',  'INET'],
+      ['device_info', 'VARCHAR(500)'],
+    ];
+    for (const [name, type] of auditColumns) {
+      await client.query(
+        `ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS ${name} ${type}`
+      );
+    }
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_audit_logs_user ON audit_logs(user_id)
     `);
