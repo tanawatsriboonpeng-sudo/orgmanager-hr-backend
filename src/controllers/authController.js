@@ -2,6 +2,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { query } = require('../../config/database');
 const { runPurgeIfDue } = require('./retentionController');
+const { runSweepIfDue } = require('./attendanceController');
 
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCK_DURATION_MINUTES = 30;
@@ -210,6 +211,10 @@ const getMe = async (req, res) => {
     // is one SELECT on org_settings unless we're actually due, and the
     // user shouldn't wait for /me on the rare day it actually runs.
     runPurgeIfDue().catch(() => {});
+    // Same lazy-daily pattern: catch up on missing-checkout rows once
+    // per day from whoever's the first to load the app. Cheap no-op
+    // after the first hit each day thanks to the in-process gate.
+    runSweepIfDue().catch(() => {});
     res.json({ success: true, data: { ...u, fullName: u ? `${u.first_name} ${u.last_name}` : null } });
   } catch (err) {
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });

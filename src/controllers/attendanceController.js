@@ -174,15 +174,25 @@ const checkIn = async (req, res) => {
     }
 
     // Off-site path: HR/owner approves later; we skip the GPS radius
-    // check but still require a reason and a selfie so there's something
-    // to review. Status is computed normally so HR sees what bucket it
-    // would have landed in; offsite_status='pending' until approved.
+    // check but still require a reason, a selfie, AND valid GPS coords
+    // so HR has the full picture when reviewing. Status is computed
+    // normally so HR sees what bucket it would have landed in;
+    // offsite_status='pending' until approved.
     if (offsite) {
       if (!reason || !String(reason).trim()) {
         return res.status(400).json({ success: false, message: 'กรุณาระบุเหตุผลที่ลงเวลานอกสถานที่' });
       }
       if (!selfie) {
         return res.status(400).json({ success: false, message: 'กรุณาถ่ายเซลฟี่ประกอบการลงเวลานอกสถานที่' });
+      }
+      // GPS is mandatory even for off-site — the whole point is for HR
+      // to verify *where* the employee actually was. Without coords the
+      // distance to office is null and there's no way to validate.
+      if (!lat || !lng) {
+        return res.status(400).json({
+          success: false,
+          message: 'กรุณาเปิด GPS — ลงเวลานอกสถานที่ต้องระบุตำแหน่งจริงเพื่อให้ HR ตรวจสอบ',
+        });
       }
     }
 
@@ -231,9 +241,21 @@ const checkIn = async (req, res) => {
     // Resolve the active shift config for today and compute status from it.
     // This honors the weekly schedule + the rules HR set in /shifts (work_start,
     // late thresholds, flex tiers), instead of the previous hardcoded 9:00.
+    //
+    // Day-off blocks BOTH normal and off-site check-ins. If a manager
+    // genuinely needs the employee to work on their day off, the right
+    // path is to update the weekly_shifts entry first (or use /ot for
+    // an explicit off-hours request) — letting off-site bypass would
+    // let the employee silently log "work" on a day they're not even
+    // scheduled, which payroll would then have to untangle.
     const { config: shiftCfg, isDayOff } = await resolveShiftConfig(emp.id, today);
     if (isDayOff) {
-      return res.status(400).json({ success: false, message: 'วันนี้เป็นวันหยุดของคุณ ไม่ต้องลงเวลา' });
+      return res.status(400).json({
+        success: false,
+        message: offsite
+          ? 'วันนี้เป็นวันหยุดของคุณ — ติดต่อ HR เพื่อปรับตารางก่อนลงเวลา'
+          : 'วันนี้เป็นวันหยุดของคุณ ไม่ต้องลงเวลา',
+      });
     }
     const { status, detail, almostLate } = calcStatus(now, shiftCfg);
 
@@ -1160,6 +1182,40 @@ async function sweepMissingCheckouts() {
   return marked;
 }
 
+// Lazy daily wrapper. Was previously only called from getDailySummary
+// — i.e. when HR/owner opened /dashboard — which meant orphaned rows
+// could pile up for days if no one looked. Now /auth/me fires this
+// fire-and-forget on every authenticated request so missing-checkout
+// notifications reach the employee within ~minutes of the next time
+// anyone (HR or the employee themselves) opens the app.
+//
+// Dedupe: process-wide promise so concurrent requests don't trigger
+// parallel sweeps, plus a daily gate (sweepLastRunDay) so even with
+// hundreds of /auth/me hits we only run the actual SQL once per day.
+// The base sweep query is already idempotent — this is a cost cap.
+let sweepInFlight = null;
+let sweepLastRunDay = null;
+async function runSweepIfDue() {
+  if (sweepInFlight) return sweepInFlight;
+  const today = nowLocal().format('YYYY-MM-DD');
+  if (sweepLastRunDay === today) return null;
+  sweepInFlight = (async () => {
+    try {
+      const marked = await sweepMissingCheckouts();
+      sweepLastRunDay = today;
+      return marked;
+    } catch (e) {
+      console.warn('[sweep-if-due] failed (non-fatal):', e.message);
+      return null;
+    } finally {
+      // Release the in-flight slot 30s later so a burst dedupes but
+      // the next legitimate day-boundary run isn't blocked.
+      setTimeout(() => { sweepInFlight = null; }, 30_000);
+    }
+  })();
+  return sweepInFlight;
+}
+
 // POST /api/attendance/sweep-missing-checkouts — HR/owner manual
 // trigger; daily-summary also calls this lazily so the queue stays
 // current without requiring a real cron.
@@ -1178,6 +1234,6 @@ module.exports = {
   getOffsitePending, approveOffsite, rejectOffsite,
   createBackdateRequest, getBackdatePending, getMyBackdateRequests,
   approveBackdate, rejectBackdate,
-  runMissingCheckoutSweep, sweepMissingCheckouts,
+  runMissingCheckoutSweep, sweepMissingCheckouts, runSweepIfDue,
   adminRecord,
 };
