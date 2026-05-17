@@ -870,6 +870,116 @@ const rejectBackdate = async (req, res) => {
   }
 };
 
+/* ===== Admin-record (HR/owner records on employee's behalf) ===== */
+// HR or owner manually logs check-in / check-out for any employee on
+// any past or current date. Bypasses approval (HR is the authority)
+// and writes straight into attendance_logs. The stamp on
+// admin_recorded_by + admin_note keeps the audit trail honest.
+
+// POST /api/attendance/admin-record
+const adminRecord = async (req, res) => {
+  const { employeeId, date, checkInTime, checkOutTime, note } = req.body;
+  if (!employeeId || !date) {
+    return res.status(400).json({ success: false, message: 'กรุณาเลือกพนักงานและวันที่' });
+  }
+  if (!checkInTime && !checkOutTime) {
+    return res.status(400).json({ success: false, message: 'กรุณาระบุเวลาเข้าหรือออกอย่างน้อย 1 อย่าง' });
+  }
+  if (dayjs(date).isAfter(nowLocal(), 'day')) {
+    return res.status(400).json({ success: false, message: 'ไม่สามารถลงเวลาในวันอนาคตได้' });
+  }
+  try {
+    const emp = await query(
+      `SELECT id, first_name, last_name FROM employees WHERE id = $1 AND is_active = true`,
+      [employeeId]
+    );
+    if (!emp.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบพนักงาน' });
+    const empRow = emp.rows[0];
+
+    // Build absolute timestamps from the date + TIME components (anchored to TZ).
+    const stamp = (t) => t ? dayjs.tz(`${date}T${String(t).slice(0,8)}`, TZ).toISOString() : null;
+    const newCheckInAt  = checkInTime  ? stamp(checkInTime)  : null;
+    const newCheckOutAt = checkOutTime ? stamp(checkOutTime) : null;
+
+    // Status only recomputed when we're (re)setting the check-in side.
+    let newStatus = null, newDetail = null, newAlmostLate = null;
+    if (checkInTime) {
+      const { config: shiftCfg } = await resolveShiftConfig(empRow.id, date);
+      const checkInAsDay = dayjs.tz(`${date}T${String(checkInTime).slice(0,8)}`, TZ);
+      const calc = calcStatus(checkInAsDay, shiftCfg);
+      newStatus = calc.status; newDetail = calc.detail; newAlmostLate = calc.almostLate;
+    }
+
+    // Recompute work_hours / ot_hours when both ends are known. If only
+    // a check-out is being added to an existing row, pull the existing
+    // check-in to do the math.
+    let workHours = null, otHours = null;
+    if (checkOutTime) {
+      let checkIn;
+      if (checkInTime) checkIn = dayjs.tz(`${date}T${String(checkInTime).slice(0,8)}`, TZ);
+      else {
+        const existing = await query(
+          'SELECT check_in_at FROM attendance_logs WHERE employee_id = $1 AND date = $2',
+          [empRow.id, date]
+        );
+        if (existing.rows[0]?.check_in_at) checkIn = dayjs(existing.rows[0].check_in_at);
+      }
+      if (checkIn) {
+        const checkOut = dayjs.tz(`${date}T${String(checkOutTime).slice(0,8)}`, TZ);
+        const minutes = checkOut.diff(checkIn, 'minute');
+        if (minutes > 0) {
+          workHours = parseFloat((minutes / 60).toFixed(2));
+          otHours = workHours > 8 ? parseFloat((workHours - 8).toFixed(2)) : 0;
+        }
+      }
+    }
+
+    // Upsert. COALESCE on the existing fields means a check-out-only
+    // edit won't clobber the existing check_in_at, and vice versa.
+    // missing_checkout gets cleared because the admin actively
+    // resolved the row.
+    await query(
+      `INSERT INTO attendance_logs
+         (employee_id, date, check_in_at, check_out_at, status, status_detail, almost_late,
+          work_hours, ot_hours, check_in_method, admin_recorded_by, admin_note, missing_checkout)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'manual', $10, $11, false)
+       ON CONFLICT (employee_id, date) DO UPDATE SET
+         check_in_at       = COALESCE($3, attendance_logs.check_in_at),
+         check_out_at      = COALESCE($4, attendance_logs.check_out_at),
+         status            = COALESCE($5, attendance_logs.status),
+         status_detail     = COALESCE($6, attendance_logs.status_detail),
+         almost_late       = COALESCE($7, attendance_logs.almost_late),
+         work_hours        = COALESCE($8, attendance_logs.work_hours),
+         ot_hours          = COALESCE($9, attendance_logs.ot_hours),
+         admin_recorded_by = $10,
+         admin_note        = COALESCE($11, attendance_logs.admin_note),
+         missing_checkout  = false,
+         updated_at        = NOW()`,
+      [empRow.id, date, newCheckInAt, newCheckOutAt,
+       newStatus, newDetail, newAlmostLate, workHours, otHours,
+       req.user.id, note ? String(note).trim() : null]
+    );
+
+    // Notify the employee — they may have been wondering why their day
+    // was empty.
+    const empUserId = await userIdFromEmployee(empRow.id);
+    const parts = [];
+    if (checkInTime)  parts.push(`เข้า ${String(checkInTime).slice(0,5)}`);
+    if (checkOutTime) parts.push(`ออก ${String(checkOutTime).slice(0,5)}`);
+    notify(empUserId, {
+      type: 'attendance_admin_recorded',
+      title: 'HR ลงเวลาให้คุณ',
+      body: `วันที่ ${dayjs(date).format('D MMM')} · ${parts.join(' / ')}` + (note ? ` · หมายเหตุ: ${String(note).trim().slice(0,60)}` : ''),
+      link: '/attendance',
+    });
+
+    res.json({ success: true, message: `ลงเวลาให้ ${empRow.first_name} ${empRow.last_name} แล้ว` });
+  } catch (err) {
+    console.error('POST /attendance/admin-record error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
 /* ===== Missing-checkout sweep ===== */
 // An employee who tapped เช็คอิน but never tapped เช็คเอาท์ before the
 // day ended would otherwise get 0 work hours for the day, and we'd
@@ -961,4 +1071,5 @@ module.exports = {
   createBackdateRequest, getBackdatePending, getMyBackdateRequests,
   approveBackdate, rejectBackdate,
   runMissingCheckoutSweep, sweepMissingCheckouts,
+  adminRecord,
 };

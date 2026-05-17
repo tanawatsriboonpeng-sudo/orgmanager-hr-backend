@@ -369,6 +369,18 @@ async function ensureSchema() {
       ALTER TABLE attendance_logs
       ADD COLUMN IF NOT EXISTS missing_checkout BOOLEAN DEFAULT false
     `);
+    // Admin-record provenance: when HR/owner uses the "ลงเวลาให้
+    // พนักงาน" button to write a row on someone else's behalf, stamp
+    // who did it + an optional note so the audit trail shows the row
+    // wasn't self-recorded.
+    await client.query(`
+      ALTER TABLE attendance_logs
+      ADD COLUMN IF NOT EXISTS admin_recorded_by UUID REFERENCES users(id)
+    `);
+    await client.query(`
+      ALTER TABLE attendance_logs
+      ADD COLUMN IF NOT EXISTS admin_note TEXT
+    `);
     // Off-site check-in: lets a field/remote employee log a check-in
     // outside the company GPS radius with a reason; HR/owner approves
     // before it counts as a real attendance entry. is_offsite=true rows

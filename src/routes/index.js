@@ -42,6 +42,9 @@ router.post('/attendance/backdate/:id/reject',  authenticate, authorize('owner',
 // Manual trigger for the missing-checkout sweep. Daily-summary also
 // invokes it lazily, so HR usually doesn't need to call this directly.
 router.post('/attendance/sweep-missing-checkouts', authenticate, authorize('owner', 'hr'), attendCtrl.runMissingCheckoutSweep);
+// HR / owner manually records check-in/check-out on someone's behalf.
+// Audit-logged so we can see who fabricated which row.
+router.post('/attendance/admin-record', authenticate, authorize('owner', 'hr'), auditLog('attendance_admin_record', 'attendance_logs'), attendCtrl.adminRecord);
 
 // ====== LEAVE ======
 router.get('/leave/types', authenticate, leaveCtrl.getLeaveTypes);
