@@ -595,6 +595,24 @@ async function ensureSchema() {
       ALTER TABLE cleaning_session_items
       ADD COLUMN IF NOT EXISTS not_done BOOLEAN DEFAULT false
     `);
+    // ====== OFFICE LOCATIONS ======
+    // Replaces the single-point COMPANY_LAT/LNG/CHECKIN_RADIUS_METERS env
+    // vars with an owner-managed list of allowed check-in spots. Each
+    // row has its own radius so a small annex can have a tighter zone
+    // than the HQ. Backwards compat: if the table is empty the
+    // attendance controller falls back to the env vars.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS office_locations (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(100) NOT NULL,
+        lat NUMERIC(10, 6) NOT NULL,
+        lng NUMERIC(10, 6) NOT NULL,
+        radius_meters INT NOT NULL DEFAULT 60,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
     console.log('🔧 schema check ok');
   } catch (e) {
     console.error('⚠️  schema check failed:', e.message);

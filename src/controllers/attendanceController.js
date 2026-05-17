@@ -18,6 +18,50 @@ const COMPANY_LAT = parseFloat(process.env.COMPANY_LAT || '13.7563');
 const COMPANY_LNG = parseFloat(process.env.COMPANY_LNG || '100.5018');
 const MAX_RADIUS = parseInt(process.env.CHECKIN_RADIUS_METERS || '60');
 
+// Multi-location check-in: walk the owner-managed office_locations
+// table; the entry is allowed if any active row matches its own radius.
+// Returns the closest match (regardless of pass/fail) plus the overall
+// pass/fail decision so the caller can surface a useful error message.
+// Falls back to the env vars when the table is empty so a fresh install
+// still works without HR having to seed anything.
+async function checkAllowedLocation(lat, lng) {
+  const r = await query(
+    `SELECT id, name, lat::float AS lat, lng::float AS lng, radius_meters
+       FROM office_locations
+      WHERE is_active = true`
+  );
+  if (r.rows.length === 0) {
+    const distance = geolib.getDistance(
+      { latitude: lat, longitude: lng },
+      { latitude: COMPANY_LAT, longitude: COMPANY_LNG }
+    );
+    return {
+      allowed: distance <= MAX_RADIUS,
+      distance,
+      radius: MAX_RADIUS,
+      matchedName: 'สำนักงาน',
+      matchedId: null,
+    };
+  }
+  let closest = { distance: Infinity, location: null };
+  let allowed = false;
+  for (const loc of r.rows) {
+    const d = geolib.getDistance(
+      { latitude: lat, longitude: lng },
+      { latitude: loc.lat, longitude: loc.lng }
+    );
+    if (d <= loc.radius_meters) allowed = true;
+    if (d < closest.distance) closest = { distance: d, location: loc };
+  }
+  return {
+    allowed,
+    distance: closest.distance,
+    radius: closest.location?.radius_meters || MAX_RADIUS,
+    matchedName: closest.location?.name || 'สำนักงาน',
+    matchedId: closest.location?.id || null,
+  };
+}
+
 // Resolve the active shift_configs row for an employee on a given date.
 // Priority:
 //   1. employees.weekly_shifts[dayOfWeek] — if it's "dayoff", short-circuit;
@@ -163,23 +207,23 @@ const checkIn = async (req, res) => {
 
     // ตรวจสอบ GPS — off-site path skips the radius check (the whole
     // point is to log a check-in from outside), but still records the
-    // distance so HR can see how far the employee was when reviewing.
+    // closest-location distance so HR sees how far the employee was
+    // when reviewing the offsite request.
     let distanceM = null;
+    let allowedLoc = null;
     if (method === 'gps' && lat && lng) {
-      distanceM = geolib.getDistance(
-        { latitude: lat, longitude: lng },
-        { latitude: COMPANY_LAT, longitude: COMPANY_LNG }
-      );
+      allowedLoc = await checkAllowedLocation(lat, lng);
+      distanceM = allowedLoc.distance;
     }
     if (!offsite && method === 'gps') {
       if (!lat || !lng) {
         return res.status(400).json({ success: false, message: 'กรุณาเปิด GPS' });
       }
-      if (distanceM > MAX_RADIUS) {
+      if (!allowedLoc?.allowed) {
         return res.status(400).json({
           success: false,
-          message: `อยู่นอกรัศมี ${MAX_RADIUS} เมตร (ระยะปัจจุบัน ${distanceM} ม.)`,
-          data: { distance: distanceM, maxRadius: MAX_RADIUS }
+          message: `อยู่นอกรัศมีที่ตั้งสำนักงาน (ใกล้สุด: ${allowedLoc.matchedName} ${distanceM} ม. / รัศมี ${allowedLoc.radius} ม.)`,
+          data: { distance: distanceM, maxRadius: allowedLoc.radius, matchedLocation: allowedLoc.matchedName }
         });
       }
     }
