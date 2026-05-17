@@ -234,8 +234,13 @@ router.get('/employees', authenticate, authorize('hr', 'owner'), async (req, res
 // to review without needing to list the whole company.
 router.get('/employees/my-subordinates', authenticate, async (req, res) => {
   try {
+    // Whitelist columns — managers don't need (and shouldn't see) salary,
+    // bank account, national ID, DOB, address, etc. Only fields the /kpi
+    // picker actually renders are returned.
     const result = await query(
-      `SELECT e.*, u.email, u.role, d.name as department_name
+      `SELECT e.id, e.first_name, e.last_name, e.nickname, e.avatar_url,
+              e.employee_id, e.position, e.position_id,
+              u.email, u.role, d.name as department_name
          FROM employees e
          LEFT JOIN users u ON e.user_id = u.id
          LEFT JOIN departments d ON e.department_id = d.id
