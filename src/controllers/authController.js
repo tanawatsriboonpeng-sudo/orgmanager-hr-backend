@@ -1,6 +1,6 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { query } = require('../../config/database');
+const { pool, query } = require('../../config/database');
 const { runPurgeIfDue } = require('./retentionController');
 const { runSweepIfDue } = require('./attendanceController');
 
@@ -145,30 +145,60 @@ const refreshToken = async (req, res) => {
       return res.status(401).json({ success: false, message: 'บัญชีไม่พร้อมใช้งาน' });
     }
 
-    const stored = await query(
-      'SELECT id, token_hash FROM refresh_tokens WHERE user_id = $1 AND expires_at > NOW()',
-      [user.id]
-    );
-    let matchedRowId = null;
-    for (const row of stored.rows) {
-      if (await bcrypt.compare(token, row.token_hash)) { matchedRowId = row.id; break; }
+    // Atomic rotation: lock the user's refresh rows, find the match,
+    // DELETE … RETURNING (so a second concurrent call sees rowCount=0
+    // and bails). Previously two parallel /refresh calls with the same
+    // token could both pass bcrypt.compare on the unlocked SELECT and
+    // both mint new pairs — a thief who races the legit user wins.
+    const client = await pool.connect();
+    let rotated;
+    try {
+      await client.query('BEGIN');
+      const stored = await client.query(
+        `SELECT id, token_hash FROM refresh_tokens
+          WHERE user_id = $1 AND expires_at > NOW()
+          FOR UPDATE`,
+        [user.id]
+      );
+      let matchedRowId = null;
+      for (const row of stored.rows) {
+        if (await bcrypt.compare(token, row.token_hash)) { matchedRowId = row.id; break; }
+      }
+      if (!matchedRowId) {
+        await client.query('ROLLBACK');
+        return res.status(401).json({ success: false, message: 'Refresh token ถูกเพิกถอน' });
+      }
+
+      // DELETE … RETURNING is the actual race guard: a concurrent
+      // request that gets here second sees rowCount=0 and gives up.
+      const del = await client.query(
+        'DELETE FROM refresh_tokens WHERE id = $1 RETURNING id',
+        [matchedRowId]
+      );
+      if (del.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(401).json({ success: false, message: 'Refresh token ถูกเพิกถอนพร้อมกัน' });
+      }
+
+      const payload = { userId: user.id, role: user.role, employeeId: user.employee_id };
+      const newAccessToken = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '8h' });
+      const newRefreshToken = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d' });
+      const newHash = await bcrypt.hash(newRefreshToken, 8);
+
+      await client.query(
+        'INSERT INTO refresh_tokens (user_id, token_hash, expires_at, device_info, ip_address) VALUES ($1, $2, NOW() + INTERVAL \'30 days\', $3, $4)',
+        [user.id, newHash, req.headers['user-agent']?.substring(0, 200), req.ip]
+      );
+      await client.query('COMMIT');
+      rotated = { accessToken: newAccessToken, refreshToken: newRefreshToken };
+    } catch (txErr) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally {
+      client.release();
     }
-    if (!matchedRowId) {
-      return res.status(401).json({ success: false, message: 'Refresh token ถูกเพิกถอน' });
-    }
 
-    const payload = { userId: user.id, role: user.role, employeeId: user.employee_id };
-    const newAccessToken = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '8h' });
-    const newRefreshToken = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d' });
-    const newHash = await bcrypt.hash(newRefreshToken, 8);
-
-    await query('DELETE FROM refresh_tokens WHERE id = $1', [matchedRowId]);
-    await query(
-      'INSERT INTO refresh_tokens (user_id, token_hash, expires_at, device_info, ip_address) VALUES ($1, $2, NOW() + INTERVAL \'30 days\', $3, $4)',
-      [user.id, newHash, req.headers['user-agent']?.substring(0, 200), req.ip]
-    );
-
-    res.json({ success: true, data: { accessToken: newAccessToken, refreshToken: newRefreshToken } });
+    res.json({ success: true, data: rotated });
   } catch (err) {
     res.status(401).json({ success: false, message: 'Refresh token ไม่ถูกต้องหรือหมดอายุ' });
   }

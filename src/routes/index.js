@@ -139,12 +139,25 @@ router.post('/ot/request', authenticate, async (req, res) => {
   }
   try {
     const { date, startTime, endTime, reason } = req.body;
+    // Validate shape before parsing. Without these guards, undefined/
+    // "abc"/"25:99" all reached the split() and produced NaN hours that
+    // silently persisted, then poisoned payroll/bulk-generate.
+    const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+    const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+    if (!DATE_RE.test(String(date || ''))) {
+      return res.status(400).json({ success: false, message: 'รูปแบบวันที่ไม่ถูกต้อง (YYYY-MM-DD)' });
+    }
+    if (!TIME_RE.test(String(startTime || '')) || !TIME_RE.test(String(endTime || ''))) {
+      return res.status(400).json({ success: false, message: 'รูปแบบเวลาไม่ถูกต้อง (HH:MM)' });
+    }
     const empResult = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
     if (!empResult.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบพนักงาน' });
     const [sh, sm] = startTime.split(':').map(Number);
     const [eh, em] = endTime.split(':').map(Number);
     const hours = parseFloat(((eh * 60 + em - sh * 60 - sm) / 60).toFixed(2));
-    if (hours <= 0) return res.status(400).json({ success: false, message: 'เวลาไม่ถูกต้อง' });
+    if (!Number.isFinite(hours) || hours <= 0 || hours > 24) {
+      return res.status(400).json({ success: false, message: 'เวลาไม่ถูกต้อง (ต้องเป็นบวกและไม่เกิน 24 ชม.)' });
+    }
     const r = await query(
       'INSERT INTO ot_requests (employee_id, date, start_time, end_time, hours, reason) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
       [empResult.rows[0].id, date, startTime, endTime, hours, reason]
@@ -279,10 +292,24 @@ router.post('/ot/:id/cancel', authenticate, async (req, res) => {
 });
 
 // ====== EMPLOYEES ======
+// List view — whitelist columns. Was `e.*` which dumped every PII
+// field (national_id, bank_account, base_salary, passport, address,
+// dob, ssn, tax_id, …) on every render of the /employees page and on
+// every dropdown that calls employeeApi.list(). That's a mass PII
+// payload per HR account refresh and a juicy target if any HR token
+// ever leaks. Open the single-employee endpoint when full details
+// are genuinely needed.
 router.get('/employees', authenticate, authorize('hr', 'owner'), async (req, res) => {
   try {
     const result = await query(
-      `SELECT e.*, u.email, u.role, u.is_active as account_active, u.last_login_at,
+      `SELECT e.id, e.employee_id, e.first_name, e.last_name, e.nickname,
+              e.first_name_en, e.last_name_en, e.nickname_en,
+              e.position, e.position_id, e.avatar_url,
+              e.department_id, e.manager_id, e.user_id,
+              e.hire_date, e.start_date,
+              e.shift_type, e.phone,
+              e.is_active, e.base_salary,
+              u.email, u.role, u.is_active as account_active, u.last_login_at,
               d.name as department_name,
               m.first_name as manager_first_name, m.last_name as manager_last_name
        FROM employees e
@@ -394,7 +421,7 @@ router.patch('/employees/me', authenticate, async (req, res) => {
     return res.status(413).json({ success: false, message: 'รูปภาพใหญ่เกินไป (สูงสุด ~500KB)' });
   }
   try {
-    await query(
+    const up = await query(
       `UPDATE employees SET
          nickname = COALESCE($1, nickname),
          phone = COALESCE($2, phone),
@@ -425,6 +452,16 @@ router.patch('/employees/me', authenticate, async (req, res) => {
         bankAccount ?? null, bankName ?? null, bankBranchCode ?? null,
       ]
     );
+    // No employee row for this user (orphan user account or owner
+    // without HR linkage) → don't claim success. Previously this
+    // silently returned 200 and the UI told the user "saved" while
+    // nothing persisted — classic data-loss confusion.
+    if (up.rowCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'ไม่พบข้อมูลพนักงานของคุณ — กรุณาติดต่อ HR',
+      });
+    }
     res.json({ success: true, message: 'อัปเดตข้อมูลส่วนตัวแล้ว' });
   } catch (e) {
     console.error('PATCH /employees/me error:', e.message);
@@ -678,25 +715,41 @@ router.post('/shifts/bulk', authenticate, authorize('hr', 'owner'), async (req, 
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ success: false, message: 'ไม่มีข้อมูล' });
   }
+  // Cap input size so a runaway client can't lock thousands of rows.
+  // 7 days × 200 employees = 1400 is plenty for any real grid save.
+  if (items.length > 2000) {
+    return res.status(413).json({ success: false, message: 'ข้อมูลเยอะเกินไป (สูงสุด 2000 รายการต่อครั้ง)' });
+  }
+  const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+  // All-or-nothing: previously each item ran as its own query with no
+  // BEGIN/COMMIT, so a network blip mid-loop left the weekly grid half-
+  // written. The user sees a partial save with no indication of which
+  // cells failed. Now wrap the whole batch in a transaction.
+  const client = await pool.connect();
   try {
+    await client.query('BEGIN');
     let upserts = 0;
     let deletes = 0;
     for (const it of items) {
       if (!it.employeeId || !it.date) continue;
+      if (!DATE_RE.test(String(it.date))) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ success: false, message: `รูปแบบวันที่ไม่ถูกต้อง: ${it.date}` });
+      }
       // "default" / empty → remove override so the cell falls back to
       // employees.shift_type. Anything else is stored verbatim (it should
       // be a shift_configs.code on the grid but we don't enforce that
       // here so legacy values like "normal"/"flexible"/"dayoff" still
       // work).
       if (it.shiftType === 'default' || it.shiftType === '' || it.shiftType == null) {
-        await query(
+        await client.query(
           'DELETE FROM shift_assignments WHERE employee_id = $1 AND date = $2',
           [it.employeeId, it.date]
         );
         deletes++;
         continue;
       }
-      await query(
+      await client.query(
         `INSERT INTO shift_assignments (employee_id, date, shift_type, notes, created_by, updated_at)
          VALUES ($1, $2, $3, $4, $5, NOW())
          ON CONFLICT (employee_id, date)
@@ -707,10 +760,14 @@ router.post('/shifts/bulk', authenticate, authorize('hr', 'owner'), async (req, 
       );
       upserts++;
     }
+    await client.query('COMMIT');
     res.json({ success: true, message: `บันทึก ${upserts} รายการ`, data: { upserts, deletes } });
   } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('POST /shifts/bulk error:', e.message);
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  } finally {
+    client.release();
   }
 });
 
