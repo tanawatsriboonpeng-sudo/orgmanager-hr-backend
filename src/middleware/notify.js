@@ -1,9 +1,18 @@
 const { query } = require('../../config/database');
+const { pushTextTo } = require('./linePush');
 
 // Fire-and-forget delivery of a single notification to one user.
 // Mirrors the auditLog pattern: failures are logged to stderr (so they
 // show up in Render logs) but never break the request that triggered
 // the notification.
+//
+// Two channels in parallel:
+//   1. In-app: INSERT into notifications (bell icon, /notifications page)
+//   2. LINE OA: pushTextTo() if the user has line_user_id linked
+//
+// Both run; one failing doesn't block the other. The LINE push is gated
+// on LINE_OA_CHANNEL_TOKEN being set (otherwise pushTextTo no-ops),
+// so this is safe to enable before the OA channel is actually wired.
 async function notify(userId, { type, title, body, link, relatedId } = {}) {
   if (!userId || !type || !title) return;
   try {
@@ -14,6 +23,22 @@ async function notify(userId, { type, title, body, link, relatedId } = {}) {
     );
   } catch (err) {
     console.error(`[notify] failed: ${type} → user ${userId}:`, err.message);
+  }
+
+  // LINE push, best-effort. Look up line_user_id lazily — most users
+  // won't have it set yet, and we don't want to add a JOIN to every
+  // notify() call site. Single cheap SELECT here is fine.
+  try {
+    const r = await query('SELECT line_user_id FROM users WHERE id = $1', [userId]);
+    const lineUserId = r.rows[0]?.line_user_id;
+    if (!lineUserId) return;
+    const text = body ? `${title}\n${body}` : title;
+    // Fire and forget — don't await so the originating request returns
+    // even if LINE is slow. The console.error inside pushTextTo handles
+    // diagnostics.
+    pushTextTo(lineUserId, text, { link }).catch(() => {});
+  } catch (err) {
+    console.error(`[notify] LINE lookup failed for user ${userId}:`, err.message);
   }
 }
 
