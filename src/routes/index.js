@@ -1250,10 +1250,27 @@ router.patch('/employees/:id', authenticate, authorize('hr','owner'),
       }
     }
 
-    // Role change is owner-only
+    // Role change is owner-only. Guard against (a) the calling owner
+    // demoting themselves and (b) demoting the last active owner — either
+    // would leave the system in an unrecoverable state.
     if (role && req.user.role === 'owner') {
-      const e = await query('SELECT user_id FROM employees WHERE id=$1', [req.params.id])
-      if (e.rows[0]) await query('UPDATE users SET role=$1 WHERE id=$2', [role, e.rows[0].user_id])
+      const e = await query(
+        'SELECT e.user_id, u.role AS current_role FROM employees e LEFT JOIN users u ON e.user_id = u.id WHERE e.id=$1',
+        [req.params.id]
+      )
+      const row = e.rows[0]
+      if (row && row.current_role !== role) {
+        if (row.user_id === req.user.id) {
+          return res.status(400).json({ success: false, message: 'เปลี่ยน role ของตัวเองไม่ได้' })
+        }
+        if (row.current_role === 'owner' && role !== 'owner') {
+          const c = await query("SELECT COUNT(*)::int AS n FROM users WHERE role='owner' AND is_active=true")
+          if ((c.rows[0]?.n || 0) <= 1) {
+            return res.status(400).json({ success: false, message: 'ระบบต้องมี owner อย่างน้อย 1 คน' })
+          }
+        }
+        await query('UPDATE users SET role=$1 WHERE id=$2', [role, row.user_id])
+      }
     }
     res.json({success:true, message:'อัปเดตสำเร็จ'})
   } catch (err) {
