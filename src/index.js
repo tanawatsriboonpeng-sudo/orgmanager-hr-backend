@@ -494,6 +494,43 @@ async function ensureSchema() {
     await client.query(`
       INSERT INTO org_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING
     `);
+    // Calendar events — owner/HR-managed meetings, seminars, company
+    // milestones. Distinct from `holidays` (which is the public/company
+    // day-off list, already used by leave + attendance) so HR can
+    // schedule things without polluting the "not a working day" logic.
+    // Read by everyone (filtered by visibility); written by HR + owner
+    // or the creator.
+    //
+    // visibility values: 'all' (everyone sees), 'department' (only that
+    // department), 'specific' (only employees in attendee_ids).
+    // end_date null = single-day event. start_time null = all-day.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS calendar_events (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        title VARCHAR(200) NOT NULL,
+        description TEXT,
+        event_type VARCHAR(40) NOT NULL DEFAULT 'meeting',
+        start_date DATE NOT NULL,
+        end_date DATE,
+        start_time TIME,
+        end_time TIME,
+        location TEXT,
+        color VARCHAR(20),
+        visibility VARCHAR(20) NOT NULL DEFAULT 'all',
+        department_id UUID REFERENCES departments(id) ON DELETE SET NULL,
+        attendee_ids UUID[],
+        created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_calendar_events_start ON calendar_events (start_date)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_calendar_events_end ON calendar_events (end_date)
+    `);
+
     // Forgot-password / OTP storage. Previously sat in an in-memory Map
     // which (a) was lost on every restart, (b) couldn't work in a
     // multi-instance deployment, and (c) had no audit trail. Stored

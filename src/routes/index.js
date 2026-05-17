@@ -832,6 +832,185 @@ router.delete('/holidays/:id', authenticate, authorize('hr', 'owner'), async (re
   } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
 });
 
+// ====== CALENDAR EVENTS ======
+// Owner/HR (or the creator) manage meetings/seminars/company events
+// that show up alongside holidays + approved leaves on /calendar.
+// Read access is filtered server-side by visibility so an employee
+// can't see "specific"/dept-only events they're not part of.
+
+// GET /api/events?from=YYYY-MM-DD&to=YYYY-MM-DD
+// Range filter is inclusive on both ends. Without dates, returns
+// from today − 30 days to today + 90 days as a sensible default
+// for callers that "just want the upcoming feed."
+router.get('/events', authenticate, async (req, res) => {
+  try {
+    const today = dayjsForNotif.tz(undefined, APP_TZ);
+    const from = req.query.from || today.subtract(30, 'day').format('YYYY-MM-DD');
+    const to   = req.query.to   || today.add(90, 'day').format('YYYY-MM-DD');
+
+    // Resolve the caller's employee row + department once so the
+    // visibility filter has what it needs without N+1ing per event.
+    const me = await query(
+      `SELECT e.id AS emp_id, e.department_id
+         FROM employees e WHERE e.user_id = $1`,
+      [req.user.id]
+    );
+    const myEmpId  = me.rows[0]?.emp_id || null;
+    const myDeptId = me.rows[0]?.department_id || null;
+    const isPriv = req.user.role === 'hr' || req.user.role === 'owner';
+
+    // HR/owner see everything; everyone else gets 'all' + their
+    // department's + events that name them specifically. The OR
+    // mirrors the same logic the UI would otherwise apply client-
+    // side, but doing it in SQL avoids leaking event titles.
+    const result = await query(
+      `SELECT ce.*,
+              CONCAT(e.first_name, ' ', e.last_name) AS created_by_name,
+              d.name AS department_name
+         FROM calendar_events ce
+         LEFT JOIN users u ON ce.created_by = u.id
+         LEFT JOIN employees e ON e.user_id = u.id
+         LEFT JOIN departments d ON ce.department_id = d.id
+        WHERE ce.start_date <= $2::date
+          AND COALESCE(ce.end_date, ce.start_date) >= $1::date
+          AND (
+            $3::boolean = true
+            OR ce.visibility = 'all'
+            OR (ce.visibility = 'department' AND ce.department_id = $4)
+            OR (ce.visibility = 'specific' AND $5 = ANY(ce.attendee_ids))
+          )
+        ORDER BY ce.start_date ASC, ce.start_time ASC NULLS FIRST`,
+      [from, to, isPriv, myDeptId, myEmpId]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (err) {
+    console.error('GET /events error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// POST /api/events
+router.post('/events',
+  authenticate, authorize('hr', 'owner'),
+  auditLog('calendar_event_create', 'calendar_events'),
+  async (req, res) => {
+  const {
+    title, description, eventType, startDate, endDate, startTime, endTime,
+    location, color, visibility, departmentId, attendeeIds,
+  } = req.body;
+  if (typeof title !== 'string' || !title.trim()) {
+    return res.status(400).json({ success: false, message: 'กรุณาระบุหัวข้อ' });
+  }
+  if (!startDate) {
+    return res.status(400).json({ success: false, message: 'กรุณาเลือกวันเริ่ม' });
+  }
+  // Cap multi-day spans at 31 days (a month) — anything longer is
+  // almost certainly a typo and would clutter the calendar view.
+  if (endDate) {
+    const span = (new Date(endDate) - new Date(startDate)) / 86_400_000;
+    if (span < 0) return res.status(400).json({ success: false, message: 'วันสิ้นสุดต้องอยู่หลังวันเริ่ม' });
+    if (span > 31) return res.status(400).json({ success: false, message: 'ช่วงวันยาวเกินไป (สูงสุด 31 วัน)' });
+  }
+  const vis = ['all', 'department', 'specific'].includes(visibility) ? visibility : 'all';
+  try {
+    const r = await query(
+      `INSERT INTO calendar_events
+         (title, description, event_type, start_date, end_date,
+          start_time, end_time, location, color,
+          visibility, department_id, attendee_ids, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       RETURNING *`,
+      [
+        title.trim(),
+        description || null,
+        eventType || 'meeting',
+        startDate,
+        endDate || null,
+        startTime || null,
+        endTime || null,
+        location || null,
+        color || null,
+        vis,
+        vis === 'department' ? (departmentId || null) : null,
+        vis === 'specific' && Array.isArray(attendeeIds) ? attendeeIds : null,
+        req.user.id,
+      ]
+    );
+    res.status(201).json({ success: true, data: r.rows[0] });
+  } catch (err) {
+    console.error('POST /events error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// PATCH /api/events/:id  (HR/owner or the original creator)
+router.patch('/events/:id',
+  authenticate,
+  auditLog('calendar_event_update', 'calendar_events'),
+  async (req, res) => {
+  try {
+    const existing = await query('SELECT created_by FROM calendar_events WHERE id = $1', [req.params.id]);
+    if (!existing.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบกิจกรรม' });
+    const isPriv = req.user.role === 'hr' || req.user.role === 'owner';
+    if (!isPriv && existing.rows[0].created_by !== req.user.id) {
+      return res.status(403).json({ success: false, message: 'แก้ไขได้เฉพาะผู้สร้างหรือ HR/owner' });
+    }
+    const {
+      title, description, eventType, startDate, endDate, startTime, endTime,
+      location, color, visibility, departmentId, attendeeIds,
+    } = req.body;
+    await query(
+      `UPDATE calendar_events SET
+         title         = COALESCE($1, title),
+         description   = COALESCE($2, description),
+         event_type    = COALESCE($3, event_type),
+         start_date    = COALESCE($4, start_date),
+         end_date      = $5,
+         start_time    = $6,
+         end_time      = $7,
+         location      = COALESCE($8, location),
+         color         = COALESCE($9, color),
+         visibility    = COALESCE($10, visibility),
+         department_id = $11,
+         attendee_ids  = $12,
+         updated_at    = NOW()
+       WHERE id = $13`,
+      [
+        title?.trim() || null, description ?? null, eventType || null,
+        startDate || null, endDate || null, startTime || null, endTime || null,
+        location ?? null, color || null, visibility || null,
+        departmentId || null,
+        Array.isArray(attendeeIds) ? attendeeIds : null,
+        req.params.id,
+      ]
+    );
+    res.json({ success: true, message: 'บันทึกแล้ว' });
+  } catch (err) {
+    console.error('PATCH /events/:id error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// DELETE /api/events/:id  (HR/owner or creator)
+router.delete('/events/:id',
+  authenticate,
+  auditLog('calendar_event_delete', 'calendar_events'),
+  async (req, res) => {
+  try {
+    const existing = await query('SELECT created_by FROM calendar_events WHERE id = $1', [req.params.id]);
+    if (!existing.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบกิจกรรม' });
+    const isPriv = req.user.role === 'hr' || req.user.role === 'owner';
+    if (!isPriv && existing.rows[0].created_by !== req.user.id) {
+      return res.status(403).json({ success: false, message: 'ลบได้เฉพาะผู้สร้างหรือ HR/owner' });
+    }
+    await query('DELETE FROM calendar_events WHERE id = $1', [req.params.id]);
+    res.json({ success: true, message: 'ลบกิจกรรมแล้ว' });
+  } catch (err) {
+    console.error('DELETE /events/:id error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
 // ====== ANNOUNCEMENTS ======
 router.get('/announcements', authenticate, async (req, res) => {
   try {
