@@ -1,4 +1,4 @@
-const { query } = require('../../config/database');
+const { query, pool } = require('../../config/database');
 const dayjs = require('dayjs');
 const { notify, notifyManyByRole, userIdFromEmployee } = require('../middleware/notify');
 
@@ -198,34 +198,46 @@ const approveRequest = async (req, res) => {
       return res.status(400).json({ success: false, message: 'คำขอนี้ดำเนินการไปแล้ว' });
     }
 
-    await query(
-      'UPDATE leave_requests SET status = $1, approved_by = $2, approved_at = NOW(), hr_notes = $3, updated_at = NOW() WHERE id = $4',
-      [action, req.user.id, hrNotes, id]
-    );
-
-    // อัปเดต quota ถ้าอนุมัติ
-    if (action === 'approved') {
-      await query(
-        `UPDATE leave_quotas SET used_days = used_days + $1
-         WHERE employee_id = $2 AND leave_type_id = $3
-         AND year = EXTRACT(YEAR FROM $4::date)`,
-        [leave.days_count, leave.employee_id, leave.leave_type_id, leave.start_date]
+    // All three writes (status update, quota deduction, attendance backfill)
+    // must succeed together. Previously each ran on its own connection, so
+    // a quota or attendance failure left the request marked approved with
+    // no quota deducted — silently inconsistent.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        'UPDATE leave_requests SET status = $1, approved_by = $2, approved_at = NOW(), hr_notes = $3, updated_at = NOW() WHERE id = $4',
+        [action, req.user.id, hrNotes, id]
       );
 
-      // บันทึก attendance_logs เป็น leave
-      let current = dayjs(leave.start_date);
-      const end = dayjs(leave.end_date);
-      while (!current.isAfter(end)) {
-        if (current.day() !== 0 && current.day() !== 6) {
-          await query(
-            `INSERT INTO attendance_logs (employee_id, date, status, status_detail)
-             VALUES ($1, $2, 'leave', 'ลาที่ได้รับอนุมัติ')
-             ON CONFLICT (employee_id, date) DO UPDATE SET status = 'leave', status_detail = 'ลาที่ได้รับอนุมัติ'`,
-            [leave.employee_id, current.format('YYYY-MM-DD')]
-          );
+      if (action === 'approved') {
+        await client.query(
+          `UPDATE leave_quotas SET used_days = used_days + $1
+           WHERE employee_id = $2 AND leave_type_id = $3
+           AND year = EXTRACT(YEAR FROM $4::date)`,
+          [leave.days_count, leave.employee_id, leave.leave_type_id, leave.start_date]
+        );
+
+        let current = dayjs(leave.start_date);
+        const end = dayjs(leave.end_date);
+        while (!current.isAfter(end)) {
+          if (current.day() !== 0 && current.day() !== 6) {
+            await client.query(
+              `INSERT INTO attendance_logs (employee_id, date, status, status_detail)
+               VALUES ($1, $2, 'leave', 'ลาที่ได้รับอนุมัติ')
+               ON CONFLICT (employee_id, date) DO UPDATE SET status = 'leave', status_detail = 'ลาที่ได้รับอนุมัติ'`,
+              [leave.employee_id, current.format('YYYY-MM-DD')]
+            );
+          }
+          current = current.add(1, 'day');
         }
-        current = current.add(1, 'day');
       }
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally {
+      client.release();
     }
 
     // Notify the employee whose request was just decided.
@@ -246,6 +258,7 @@ const approveRequest = async (req, res) => {
       message: action === 'approved' ? 'อนุมัติคำขอลาแล้ว' : 'ปฏิเสธคำขอลาแล้ว'
     });
   } catch (err) {
+    console.error('PATCH /leave/:id/approve error:', err.message);
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
 };
