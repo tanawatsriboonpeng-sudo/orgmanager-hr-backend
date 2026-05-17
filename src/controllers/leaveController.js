@@ -438,15 +438,31 @@ const approveRequest = async (req, res) => {
           [leave.days_count, leave.employee_id, leave.leave_type_id, leave.start_date]
         );
 
+        // Pull holidays in the leave range once so the per-day loop
+        // can skip them. Before this, the loop wrote `status='leave'`
+        // onto a public-holiday date, which then made the dashboard's
+        // "ลา" bucket inflate and "ยังไม่เข้า" hide a real holiday.
+        // The employee shouldn't burn quota for a holiday either —
+        // but the `days_count` was already computed via countWorkingDays
+        // upstream (which knows about holidays), so the quota math
+        // stays correct; we just need to not stamp the attendance row.
+        const holidayRes = await client.query(
+          `SELECT date::text AS d FROM holidays
+            WHERE date BETWEEN $1::date AND $2::date`,
+          [leave.start_date, leave.end_date]
+        );
+        const holidaySet = new Set(holidayRes.rows.map(r => r.d));
+
         let current = dayjs(leave.start_date);
         const end = dayjs(leave.end_date);
         while (!current.isAfter(end)) {
-          if (current.day() !== 0 && current.day() !== 6) {
+          const ymd = current.format('YYYY-MM-DD');
+          if (current.day() !== 0 && current.day() !== 6 && !holidaySet.has(ymd)) {
             await client.query(
               `INSERT INTO attendance_logs (employee_id, date, status, status_detail)
                VALUES ($1, $2, 'leave', 'ลาที่ได้รับอนุมัติ')
                ON CONFLICT (employee_id, date) DO UPDATE SET status = 'leave', status_detail = 'ลาที่ได้รับอนุมัติ'`,
-              [leave.employee_id, current.format('YYYY-MM-DD')]
+              [leave.employee_id, ymd]
             );
           }
           current = current.add(1, 'day');
@@ -860,17 +876,27 @@ const adminCreateLeave = async (req, res) => {
       );
     }
     // Mark the affected weekdays as 'leave' in attendance_logs — same
-    // pattern as approveRequest, keeps daily stats consistent.
+    // pattern as approveRequest, keeps daily stats consistent. Holidays
+    // get skipped (same reasoning as approveRequest): a public-holiday
+    // date already wasn't counted toward daysCount upstream by
+    // countWorkingDays, so we shouldn't stamp 'leave' on it either.
+    const holidayResAdmin = await client.query(
+      `SELECT date::text AS d FROM holidays
+        WHERE date BETWEEN $1::date AND $2::date`,
+      [startDate, endDate]
+    );
+    const holidaySetAdmin = new Set(holidayResAdmin.rows.map(r => r.d));
     let current = dayjs(startDate);
     const endD = dayjs(endDate);
     while (!current.isAfter(endD)) {
-      if (current.day() !== 0 && current.day() !== 6) {
+      const ymdAdmin = current.format('YYYY-MM-DD');
+      if (current.day() !== 0 && current.day() !== 6 && !holidaySetAdmin.has(ymdAdmin)) {
         await client.query(
           `INSERT INTO attendance_logs (employee_id, date, status, status_detail)
              VALUES ($1, $2, 'leave', 'ลาที่บันทึกย้อนหลัง')
            ON CONFLICT (employee_id, date) DO UPDATE
              SET status = 'leave', status_detail = 'ลาที่บันทึกย้อนหลัง'`,
-          [employeeId, current.format('YYYY-MM-DD')]
+          [employeeId, ymdAdmin]
         );
       }
       current = current.add(1, 'day');

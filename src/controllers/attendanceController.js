@@ -429,10 +429,34 @@ const getDailySummary = async (req, res) => {
     );
     const date = req.query.date || nowLocal().format('YYYY-MM-DD');
 
-    const [total, logs] = await Promise.all([
-      query('SELECT COUNT(*) as count FROM employees WHERE is_active = true'),
+    // Three changes from the old query:
+    //   1. Roster EXCLUDES owners — they're blocked from check-in by
+    //      blockOwner middleware, so counting them inflated the total
+    //      and made every owner a permanent "ยังไม่เข้า" entry.
+    //   2. Pull weekly_shifts so we can tag each person's dayoff
+    //      status for the requested date — a dayoff employee correctly
+    //      not checking in shouldn't drag attendance_rate to 0.
+    //   3. Return the full roster (not just the people who checked
+    //      in) so the small-company dashboard can render a named-list
+    //      view of everyone with their status today.
+    const dowKey = String(dayjs(date).day());
+    const [roster, logs, holidays] = await Promise.all([
       query(
-        `SELECT a.*, e.first_name, e.last_name, e.employee_id as emp_code,
+        `SELECT e.id, e.first_name, e.last_name, e.nickname, e.avatar_url,
+                e.employee_id AS emp_code, e.position, e.shift_type,
+                e.weekly_shifts,
+                d.name AS department_name
+           FROM employees e
+           JOIN users u ON e.user_id = u.id
+           LEFT JOIN departments d ON e.department_id = d.id
+          WHERE e.is_active = true
+            AND u.is_active = true
+            AND u.role <> 'owner'
+          ORDER BY e.first_name, e.last_name`
+      ),
+      query(
+        `SELECT a.*, e.first_name, e.last_name, e.nickname, e.avatar_url,
+                e.employee_id as emp_code,
                 d.name as department, e.shift_type
          FROM attendance_logs a
          JOIN employees e ON a.employee_id = e.id
@@ -440,10 +464,30 @@ const getDailySummary = async (req, res) => {
          WHERE a.date = $1
          ORDER BY a.check_in_at ASC NULLS LAST`,
         [date]
-      )
+      ),
+      // Holidays table may not be populated yet — empty array on miss
+      // keeps the rest of the function working unchanged.
+      query(
+        `SELECT id, name, type FROM holidays WHERE date = $1`,
+        [date]
+      ).catch(() => ({ rows: [] })),
     ]);
 
-    const totalEmp = parseInt(total.rows[0].count);
+    const todaysHoliday = holidays.rows[0] || null;
+    // Tag the roster: per-person "should they be working today?"
+    // Used both for the notCheckedIn count (skip dayoff/holiday) and
+    // exposed to the frontend so the person-list view can render
+    // appropriate badges instead of a red "ยังไม่เข้า" pill.
+    const rosterTagged = roster.rows.map(emp => {
+      const ws = emp.weekly_shifts || {};
+      return {
+        ...emp,
+        is_day_off:   ws[dowKey] === 'dayoff',
+        is_holiday:   !!todaysHoliday,
+        holiday_name: todaysHoliday?.name || null,
+      };
+    });
+
     // A rejected off-site check-in is treated as if the employee never
     // checked in — they go back into the "ยังไม่เข้า" bucket and don't
     // count toward present/late/etc. The original row is still here so
@@ -451,40 +495,55 @@ const getDailySummary = async (req, res) => {
     const isRejectedOffsite = r => r.is_offsite && r.offsite_status === 'rejected';
     const counted  = logs.rows.filter(r => !isRejectedOffsite(r));
     const rejected = logs.rows.filter(isRejectedOffsite);
+    const checkedInIds = new Set(counted.map(r => r.employee_id));
+
+    // Working denominator = roster minus dayoffs minus holidays, so
+    // attendance_rate reflects "did the people who were SUPPOSED to
+    // work actually show up?" instead of penalizing the schedule.
+    const expectedToWork = rosterTagged.filter(r => !r.is_day_off && !r.is_holiday);
+    const totalEmp = rosterTagged.length;       // for headline "พนักงาน N คน"
+    const expectedEmp = expectedToWork.length;  // for the rate denominator
 
     const present    = counted.filter(r => r.status === 'present').length;
     const almostLate = counted.filter(r => r.status === 'present' && r.almost_late).length;
     const late       = counted.filter(r => r.status === 'late').length;
     const absent     = counted.filter(r => r.status === 'absent').length;
     const onLeave    = counted.filter(r => r.status === 'leave').length;
+    // notCheckedIn excludes dayoff + holiday people so a Saturday
+    // doesn't read as "everyone's missing." Also excludes anyone
+    // already represented by a counted row.
+    const notCheckedIn = expectedToWork.filter(r => !checkedInIds.has(r.id)).length;
 
     res.json({
       success: true,
       data: {
         date,
+        holiday: todaysHoliday,  // null on a normal weekday
         summary: {
           total: totalEmp,
+          expected: expectedEmp,
           present,
           almostLate,
           late,
           absent,
           leave: onLeave,
           rejected: rejected.length,
-          // rejected rows are treated as if the employee never checked in
-          notCheckedIn: Math.max(0, totalEmp - counted.length),
-          // Guard divide-by-zero — a brand-new install with zero active
-          // employees would otherwise return NaN here, which the
-          // dashboard renders as "NaN%". Returning 0 keeps the
-          // progress bar empty cleanly.
-          attendanceRate: totalEmp > 0
-            ? parseFloat(((present + late) / totalEmp * 100).toFixed(1))
+          notCheckedIn,
+          // Guard divide-by-zero — a brand-new install with zero
+          // active employees would otherwise return NaN.
+          attendanceRate: expectedEmp > 0
+            ? parseFloat(((present + late) / expectedEmp * 100).toFixed(1))
             : 0
         },
+        // Full named roster so the frontend can render a per-person
+        // status list (no need for a second /employees call).
+        roster: rosterTagged,
         records: counted,
         rejectedRecords: rejected,
       }
     });
   } catch (err) {
+    console.error('GET /attendance/daily-summary error:', err.message);
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
 };
@@ -510,22 +569,34 @@ const getRecentSummary = async (req, res) => {
     const start = dates[0];
     const stop  = dates[dates.length - 1];
 
-    const result = await query(
-      `SELECT date::text AS d,
-              COUNT(*) FILTER (WHERE status = 'present' AND NOT almost_late)::int AS present,
-              COUNT(*) FILTER (WHERE status = 'present' AND almost_late)::int     AS almost_late,
-              COUNT(*) FILTER (WHERE status = 'late')::int                        AS late,
-              COUNT(*) FILTER (WHERE status = 'absent')::int                      AS absent,
-              COUNT(*) FILTER (WHERE status = 'leave')::int                       AS leave,
-              COUNT(*) FILTER (WHERE status = 'very_late')::int                   AS very_late
-         FROM attendance_logs
-        WHERE date BETWEEN $1 AND $2
-          AND NOT (is_offsite = true AND offsite_status = 'rejected')
-        GROUP BY date`,
-      [start, stop]
-    );
+    // Pull both stats AND holiday rows in parallel. The holiday lookup
+    // is empty-tolerant so a missing/legacy table doesn't kill the
+    // chart — it just won't get holiday markers.
+    const [result, holidayRes] = await Promise.all([
+      query(
+        `SELECT date::text AS d,
+                COUNT(*) FILTER (WHERE status = 'present' AND NOT almost_late)::int AS present,
+                COUNT(*) FILTER (WHERE status = 'present' AND almost_late)::int     AS almost_late,
+                COUNT(*) FILTER (WHERE status = 'late')::int                        AS late,
+                COUNT(*) FILTER (WHERE status = 'absent')::int                      AS absent,
+                COUNT(*) FILTER (WHERE status = 'leave')::int                       AS leave,
+                COUNT(*) FILTER (WHERE status = 'very_late')::int                   AS very_late
+           FROM attendance_logs
+          WHERE date BETWEEN $1 AND $2
+            AND NOT (is_offsite = true AND offsite_status = 'rejected')
+          GROUP BY date`,
+        [start, stop]
+      ),
+      query(
+        `SELECT date::text AS d, name FROM holidays
+          WHERE date BETWEEN $1 AND $2`,
+        [start, stop]
+      ).catch(() => ({ rows: [] })),
+    ]);
     const byDate = {};
     for (const r of result.rows) byDate[r.d] = r;
+    const holidayByDate = {};
+    for (const h of holidayRes.rows) holidayByDate[h.d] = h.name;
 
     // Thai single-char day labels (Sun..Sat) to match the dashboard's
     // existing axis style: อา / จ / อ / พ / พฤ / ศ / ส.
@@ -533,6 +604,7 @@ const getRecentSummary = async (req, res) => {
     const rows = dates.map(d => {
       const dow = dayjs(d).day();
       const row = byDate[d] || { present: 0, almost_late: 0, late: 0, absent: 0, leave: 0, very_late: 0 };
+      const holidayName = holidayByDate[d] || null;
       return {
         date: d,
         day: DAY_TH[dow],
@@ -541,6 +613,10 @@ const getRecentSummary = async (req, res) => {
         late: row.late + row.very_late,             // collapse very_late into late
         absent: row.absent,
         leave: row.leave,
+        // Per-day holiday marker so the chart can render a label/tint
+        // instead of a misleading "everyone absent" bar.
+        is_holiday: !!holidayName,
+        holiday_name: holidayName,
       };
     });
 
@@ -1127,13 +1203,21 @@ async function sweepMissingCheckouts() {
   // Pull every row that needs processing in one query. Date filter uses
   // the local "today" so rows from earlier today (still potentially in
   // progress) are not swept yet.
+  //
+  // LEFT JOIN holidays so we can drop rows where the employee
+  // technically tapped check-in on a public-holiday date (e.g. came
+  // in voluntarily, or HR backfilled it). Pulling weekly_shifts +
+  // computing dayoff in-loop is cheaper than rejoining with a
+  // synthetic table, and we already need shift_type below anyway.
   const today = nowLocal().format('YYYY-MM-DD');
   const r = await query(
     `SELECT a.id, a.employee_id, a.date, a.check_in_at,
             e.shift_type, e.weekly_shifts,
-            CONCAT(e.first_name, ' ', e.last_name) AS emp_name
+            CONCAT(e.first_name, ' ', e.last_name) AS emp_name,
+            h.id AS holiday_id
        FROM attendance_logs a
        JOIN employees e ON a.employee_id = e.id
+       LEFT JOIN holidays h ON h.date = a.date
       WHERE a.check_in_at IS NOT NULL
         AND a.check_out_at IS NULL
         AND a.date < $1::date
@@ -1143,6 +1227,12 @@ async function sweepMissingCheckouts() {
   );
   let marked = 0;
   for (const row of r.rows) {
+    // Skip dayoff + holiday: an employee who came in on their day
+    // off (or a public holiday) shouldn't get the "you forgot to
+    // tap out" deduction since they weren't even expected to work.
+    if (row.holiday_id) continue;
+    const dowKey = String(dayjs(row.date).day());
+    if (row.weekly_shifts && row.weekly_shifts[dowKey] === 'dayoff') continue;
     // Use the shift configured for that date to know the full workday
     // length; halve it. Fallback to 8h × 0.5 = 4h.
     let standardHours = 8;
