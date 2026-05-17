@@ -437,6 +437,95 @@ async function ensureSchema() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_kpi_reviews_employee ON kpi_reviews(employee_id, year DESC, quarter DESC)
     `);
+    // ====== CLEANING ROSTER ======
+    // Shared-responsibility cleaning rota. Master list of items + a tiny
+    // schedule config + a round-robin inspector queue. Each scheduled day
+    // gets exactly one session row with a snapshot of the active items
+    // (so editing the master list doesn't rewrite history).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS cleaning_items (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(200) NOT NULL,
+        description TEXT,
+        display_order INT DEFAULT 0,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    // Singleton row at id=1 — weekdays as INT[] (0=Sun..6=Sat).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS cleaning_settings (
+        id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        weekdays INT[] DEFAULT '{}',
+        start_time TIME DEFAULT '09:00',
+        end_time TIME DEFAULT '09:30',
+        is_active BOOLEAN DEFAULT true,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await client.query(`INSERT INTO cleaning_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING`);
+    // Inspector queue. position is the round-robin ordinal; pointer below
+    // advances modulo COUNT(is_active=true) so removing/reordering people
+    // still works without rewriting all positions.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS cleaning_inspector_queue (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        employee_id UUID REFERENCES employees(id) ON DELETE CASCADE UNIQUE,
+        position INT NOT NULL,
+        is_active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS cleaning_queue_pointer (
+        id INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+        next_position INT DEFAULT 0,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await client.query(`INSERT INTO cleaning_queue_pointer (id) VALUES (1) ON CONFLICT (id) DO NOTHING`);
+    // One session per calendar day. status flow:
+    //   open → inspector_reviewed → approved
+    //                            └→ rejected (back to open for rework)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS cleaning_sessions (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        session_date DATE NOT NULL UNIQUE,
+        start_time TIME NOT NULL,
+        end_time TIME NOT NULL,
+        inspector_id UUID REFERENCES employees(id),
+        status VARCHAR(30) DEFAULT 'open' CHECK (status IN ('open','inspector_reviewed','approved','rejected')),
+        inspector_notes TEXT,
+        inspector_completed_at TIMESTAMPTZ,
+        approved_by UUID REFERENCES users(id),
+        approved_at TIMESTAMPTZ,
+        hr_notes TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_cleaning_sessions_date ON cleaning_sessions(session_date DESC)
+    `);
+    // Snapshot of the master list at session-create time. item_name is the
+    // text shown forever; item_id is a soft reference (SET NULL if master
+    // row deleted) only kept for analytics.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS cleaning_session_items (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        session_id UUID NOT NULL REFERENCES cleaning_sessions(id) ON DELETE CASCADE,
+        item_id UUID REFERENCES cleaning_items(id) ON DELETE SET NULL,
+        item_name VARCHAR(200) NOT NULL,
+        display_order INT DEFAULT 0,
+        done_by_employee_id UUID REFERENCES employees(id) ON DELETE SET NULL,
+        inspector_note TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_cleaning_session_items_session ON cleaning_session_items(session_id)
+    `);
     console.log('🔧 schema check ok');
   } catch (e) {
     console.error('⚠️  schema check failed:', e.message);

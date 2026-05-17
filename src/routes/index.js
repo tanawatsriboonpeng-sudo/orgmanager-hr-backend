@@ -2344,4 +2344,576 @@ router.post('/auth/reset-password', async (req, res) => {
     res.json({ success: true, message: 'เปลี่ยนรหัสผ่านสำเร็จ' })
   } catch (err) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }) }
 })
+// ====== CLEANING ROSTER ======
+// Shared-responsibility rota. Everyone sees today's list; only the
+// inspector for the day fills in "who did what" + per-item notes; HR or
+// owner closes the loop with approve/reject. Inspector queue advances
+// by one position every time HR approves a session.
+
+// Helper: today's date in Asia/Bangkok as 'YYYY-MM-DD'. We do all
+// scheduling in local civil time so a session created at 11pm UTC still
+// counts as "tomorrow's" cleaning in Thailand.
+function bangkokDateISO(d = new Date()) {
+  // Bangkok is UTC+7, no DST. Shift by 7h and slice.
+  const shifted = new Date(d.getTime() + 7 * 60 * 60 * 1000);
+  return shifted.toISOString().slice(0, 10);
+}
+
+// ---- Items (master list) ----
+router.get('/cleaning/items', authenticate, async (req, res) => {
+  try {
+    const includeInactive = req.query.includeInactive === '1' || req.query.includeInactive === 'true';
+    const r = await query(
+      `SELECT id, name, description, display_order, is_active, created_at
+         FROM cleaning_items
+        ${includeInactive ? '' : 'WHERE is_active = true'}
+        ORDER BY display_order, name`
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (e) {
+    console.error('GET /cleaning/items error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.post('/cleaning/items', authenticate, authorize('hr', 'owner'),
+  auditLog('cleaning_item_create', 'cleaning_items'),
+  async (req, res) => {
+  const { name, description, displayOrder } = req.body;
+  if (!name || !String(name).trim()) {
+    return res.status(400).json({ success: false, message: 'กรุณาระบุชื่องาน' });
+  }
+  try {
+    const r = await query(
+      `INSERT INTO cleaning_items (name, description, display_order)
+       VALUES ($1, $2, $3) RETURNING *`,
+      [String(name).trim(), description || null, Number.isFinite(+displayOrder) ? +displayOrder : 0]
+    );
+    res.status(201).json({ success: true, data: r.rows[0] });
+  } catch (e) {
+    console.error('POST /cleaning/items error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.patch('/cleaning/items/:id', authenticate, authorize('hr', 'owner'),
+  auditLog('cleaning_item_update', 'cleaning_items'),
+  async (req, res) => {
+  const { name, description, displayOrder, isActive } = req.body;
+  try {
+    await query(
+      `UPDATE cleaning_items SET
+         name          = COALESCE($1, name),
+         description   = COALESCE($2, description),
+         display_order = COALESCE($3, display_order),
+         is_active     = COALESCE($4, is_active),
+         updated_at    = NOW()
+       WHERE id = $5`,
+      [name ?? null, description ?? null,
+       displayOrder ?? null, typeof isActive === 'boolean' ? isActive : null,
+       req.params.id]
+    );
+    res.json({ success: true, message: 'อัปเดตแล้ว' });
+  } catch (e) {
+    console.error('PATCH /cleaning/items/:id error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.delete('/cleaning/items/:id', authenticate, authorize('hr', 'owner'),
+  auditLog('cleaning_item_delete', 'cleaning_items'),
+  async (req, res) => {
+  try {
+    await query('DELETE FROM cleaning_items WHERE id = $1', [req.params.id]);
+    res.json({ success: true, message: 'ลบแล้ว' });
+  } catch (e) {
+    console.error('DELETE /cleaning/items/:id error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// ---- Settings (singleton) ----
+router.get('/cleaning/settings', authenticate, async (req, res) => {
+  try {
+    const r = await query('SELECT * FROM cleaning_settings WHERE id = 1');
+    res.json({ success: true, data: r.rows[0] || null });
+  } catch (e) {
+    console.error('GET /cleaning/settings error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.patch('/cleaning/settings', authenticate, authorize('hr', 'owner'),
+  auditLog('cleaning_settings_update', 'cleaning_settings'),
+  async (req, res) => {
+  const { weekdays, startTime, endTime, isActive } = req.body;
+  // Validate weekdays array: every element must be 0..6.
+  let validWeekdays = null;
+  if (Array.isArray(weekdays)) {
+    if (!weekdays.every(d => Number.isInteger(d) && d >= 0 && d <= 6)) {
+      return res.status(400).json({ success: false, message: 'วันในสัปดาห์ต้องอยู่ในช่วง 0-6' });
+    }
+    validWeekdays = [...new Set(weekdays)].sort();
+  }
+  try {
+    await query(
+      `UPDATE cleaning_settings SET
+         weekdays   = COALESCE($1, weekdays),
+         start_time = COALESCE($2, start_time),
+         end_time   = COALESCE($3, end_time),
+         is_active  = COALESCE($4, is_active),
+         updated_at = NOW()
+       WHERE id = 1`,
+      [validWeekdays, startTime ?? null, endTime ?? null,
+       typeof isActive === 'boolean' ? isActive : null]
+    );
+    res.json({ success: true, message: 'บันทึกแล้ว' });
+  } catch (e) {
+    console.error('PATCH /cleaning/settings error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// ---- Inspector queue ----
+// GET returns the queue in position order with employee info joined,
+// plus the pointer so the UI can mark "next up".
+router.get('/cleaning/inspector-queue', authenticate, async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT q.id, q.employee_id, q.position, q.is_active,
+              e.first_name, e.last_name, e.nickname, e.avatar_url, e.employee_id AS emp_code,
+              e.is_active AS employee_active
+         FROM cleaning_inspector_queue q
+         LEFT JOIN employees e ON q.employee_id = e.id
+        ORDER BY q.position`
+    );
+    const p = await query('SELECT next_position FROM cleaning_queue_pointer WHERE id = 1');
+    res.json({ success: true, data: { queue: r.rows, nextPosition: p.rows[0]?.next_position || 0 } });
+  } catch (e) {
+    console.error('GET /cleaning/inspector-queue error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// Bulk replace: accepts { employeeIds: [...] } and rewrites the queue in
+// that order. Simpler than per-row CRUD for what is essentially an
+// ordered list managed in one screen.
+router.put('/cleaning/inspector-queue', authenticate, authorize('hr', 'owner'),
+  auditLog('cleaning_queue_replace', 'cleaning_inspector_queue'),
+  async (req, res) => {
+  const { employeeIds } = req.body;
+  if (!Array.isArray(employeeIds)) {
+    return res.status(400).json({ success: false, message: 'รูปแบบข้อมูลไม่ถูกต้อง' });
+  }
+  const unique = [...new Set(employeeIds.filter(Boolean))];
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM cleaning_inspector_queue');
+    for (let i = 0; i < unique.length; i++) {
+      await client.query(
+        `INSERT INTO cleaning_inspector_queue (employee_id, position) VALUES ($1, $2)`,
+        [unique[i], i]
+      );
+    }
+    // Clamp pointer if the queue shrunk below the previous pointer.
+    await client.query(
+      `UPDATE cleaning_queue_pointer
+          SET next_position = CASE WHEN $1 = 0 THEN 0 ELSE LEAST(next_position, $1 - 1) END,
+              updated_at = NOW()
+        WHERE id = 1`,
+      [unique.length]
+    );
+    await client.query('COMMIT');
+    res.json({ success: true, message: 'บันทึกคิวแล้ว', data: { count: unique.length } });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('PUT /cleaning/inspector-queue error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  } finally { client.release(); }
+});
+
+// ---- Sessions ----
+// Helper: pick the next eligible inspector from the queue. Returns the
+// employees.id (or null if no eligible person). "Eligible" = queue row
+// active AND the underlying employee still active. We honor the pointer
+// but skip over inactive entries so the queue degrades gracefully.
+async function pickNextInspector(client) {
+  const q = await (client || { query }).query(
+    `SELECT q.position, q.employee_id
+       FROM cleaning_inspector_queue q
+       JOIN employees e ON q.employee_id = e.id
+      WHERE q.is_active = true AND e.is_active = true
+      ORDER BY q.position`
+  );
+  if (q.rows.length === 0) return { employeeId: null, position: 0 };
+  const ptrRes = await (client || { query }).query(
+    'SELECT next_position FROM cleaning_queue_pointer WHERE id = 1'
+  );
+  const ptr = ptrRes.rows[0]?.next_position || 0;
+  // Find the first row at or after pointer, wrapping to start.
+  const idx = q.rows.findIndex(r => r.position >= ptr);
+  const chosen = idx >= 0 ? q.rows[idx] : q.rows[0];
+  return { employeeId: chosen.employee_id, position: chosen.position };
+}
+
+// GET /cleaning/today — lazy-create today's session if the schedule says
+// so and one doesn't exist. Returns the session (or null if today isn't
+// a scheduled day / settings disabled / no items). Anyone authenticated.
+router.get('/cleaning/today', authenticate, async (req, res) => {
+  try {
+    const today = bangkokDateISO();
+    const dow = new Date(today + 'T00:00:00').getDay(); // 0..6
+    const settingsRes = await query('SELECT * FROM cleaning_settings WHERE id = 1');
+    const s = settingsRes.rows[0];
+    if (!s || !s.is_active || !Array.isArray(s.weekdays) || !s.weekdays.includes(dow)) {
+      // Not a cleaning day — still return any existing session for today
+      // so UI can show a re-opened/in-flight rejection from a prior call.
+      const existing = await query('SELECT id FROM cleaning_sessions WHERE session_date = $1', [today]);
+      if (!existing.rows[0]) return res.json({ success: true, data: null });
+    }
+
+    let session = (await query(
+      'SELECT * FROM cleaning_sessions WHERE session_date = $1', [today]
+    )).rows[0];
+
+    if (!session) {
+      // Lazy-create. Snapshot active items + assign inspector from queue.
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const items = await client.query(
+          `SELECT id, name, display_order FROM cleaning_items
+            WHERE is_active = true ORDER BY display_order, name`
+        );
+        if (items.rows.length === 0) {
+          await client.query('ROLLBACK');
+          return res.json({ success: true, data: null, message: 'ยังไม่มีรายการงานทำความสะอาด' });
+        }
+        const { employeeId: inspectorId } = await pickNextInspector(client);
+        const ins = await client.query(
+          `INSERT INTO cleaning_sessions (session_date, start_time, end_time, inspector_id)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (session_date) DO NOTHING
+           RETURNING *`,
+          [today, s.start_time, s.end_time, inspectorId]
+        );
+        session = ins.rows[0];
+        if (!session) {
+          // Race: another request created it. Just fetch.
+          session = (await client.query(
+            'SELECT * FROM cleaning_sessions WHERE session_date = $1', [today]
+          )).rows[0];
+        } else {
+          // First creator: insert snapshot rows.
+          for (const it of items.rows) {
+            await client.query(
+              `INSERT INTO cleaning_session_items
+                 (session_id, item_id, item_name, display_order)
+               VALUES ($1, $2, $3, $4)`,
+              [session.id, it.id, it.name, it.display_order]
+            );
+          }
+          // Broadcast to everyone active.
+          const allUsers = await client.query(
+            `SELECT id FROM users WHERE is_active = true`
+          );
+          const inspectorEmp = inspectorId
+            ? await client.query(
+                `SELECT CONCAT(first_name, ' ', last_name) AS name FROM employees WHERE id = $1`,
+                [inspectorId]
+              )
+            : { rows: [] };
+          await client.query('COMMIT');
+          const inspectorName = inspectorEmp.rows[0]?.name || 'ยังไม่กำหนด';
+          const timeRange = `${s.start_time.slice(0,5)}-${s.end_time.slice(0,5)}`;
+          for (const u of allUsers.rows) {
+            notify(u.id, {
+              type: 'cleaning_session_new',
+              title: 'ตารางทำความสะอาดวันนี้',
+              body: `${timeRange} · ผู้ตรวจ: ${inspectorName}`,
+              link: '/cleaning',
+              relatedId: session.id,
+            });
+          }
+        }
+      } catch (txErr) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw txErr;
+      } finally { client.release(); }
+    }
+
+    // Return full detail (matches GET /sessions/:id shape).
+    const full = await loadSessionDetail(session.id);
+    res.json({ success: true, data: full });
+  } catch (e) {
+    console.error('GET /cleaning/today error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+async function loadSessionDetail(sessionId) {
+  const s = await query(
+    `SELECT s.*,
+            insp.first_name AS inspector_first_name,
+            insp.last_name  AS inspector_last_name,
+            insp.nickname   AS inspector_nickname,
+            insp.avatar_url AS inspector_avatar_url,
+            approver_emp.first_name AS approver_first_name,
+            approver_emp.last_name  AS approver_last_name
+       FROM cleaning_sessions s
+       LEFT JOIN employees insp ON s.inspector_id = insp.id
+       LEFT JOIN users approver_u ON s.approved_by = approver_u.id
+       LEFT JOIN employees approver_emp ON approver_emp.user_id = approver_u.id
+      WHERE s.id = $1`,
+    [sessionId]
+  );
+  if (!s.rows[0]) return null;
+  const items = await query(
+    `SELECT i.id, i.item_id, i.item_name, i.display_order,
+            i.done_by_employee_id, i.inspector_note,
+            de.first_name AS done_by_first_name,
+            de.last_name  AS done_by_last_name,
+            de.nickname   AS done_by_nickname,
+            de.avatar_url AS done_by_avatar_url
+       FROM cleaning_session_items i
+       LEFT JOIN employees de ON i.done_by_employee_id = de.id
+      WHERE i.session_id = $1
+      ORDER BY i.display_order, i.item_name`,
+    [sessionId]
+  );
+  return { ...s.rows[0], items: items.rows };
+}
+
+router.get('/cleaning/sessions', authenticate, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    const r = await query(
+      `SELECT s.id, s.session_date, s.start_time, s.end_time, s.status,
+              s.inspector_id, s.approved_at,
+              insp.first_name AS inspector_first_name,
+              insp.last_name  AS inspector_last_name,
+              insp.nickname   AS inspector_nickname,
+              insp.avatar_url AS inspector_avatar_url,
+              (SELECT COUNT(*) FROM cleaning_session_items WHERE session_id = s.id)::int AS item_count,
+              (SELECT COUNT(*) FROM cleaning_session_items
+                WHERE session_id = s.id AND done_by_employee_id IS NOT NULL)::int AS filled_count
+         FROM cleaning_sessions s
+         LEFT JOIN employees insp ON s.inspector_id = insp.id
+        ORDER BY s.session_date DESC
+        LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (e) {
+    console.error('GET /cleaning/sessions error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.get('/cleaning/sessions/:id', authenticate, async (req, res) => {
+  try {
+    const full = await loadSessionDetail(req.params.id);
+    if (!full) return res.status(404).json({ success: false, message: 'ไม่พบรอบ' });
+    res.json({ success: true, data: full });
+  } catch (e) {
+    console.error('GET /cleaning/sessions/:id error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// HR/owner can swap the inspector mid-session (e.g. assigned person is
+// on leave). Doesn't affect queue rotation — pointer still advances at
+// approve time so the original person comes back around naturally.
+router.patch('/cleaning/sessions/:id/inspector', authenticate, authorize('hr', 'owner'),
+  auditLog('cleaning_inspector_reassign', 'cleaning_sessions'),
+  async (req, res) => {
+  const { employeeId } = req.body;
+  if (!employeeId) return res.status(400).json({ success: false, message: 'กรุณาระบุพนักงาน' });
+  try {
+    const s = await query('SELECT status FROM cleaning_sessions WHERE id = $1', [req.params.id]);
+    if (!s.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบรอบ' });
+    if (s.rows[0].status === 'approved') {
+      return res.status(400).json({ success: false, message: 'รอบที่อนุมัติแล้วเปลี่ยนผู้ตรวจไม่ได้' });
+    }
+    await query(
+      'UPDATE cleaning_sessions SET inspector_id = $1, updated_at = NOW() WHERE id = $2',
+      [employeeId, req.params.id]
+    );
+    const empUser = await userIdFromEmployee(employeeId);
+    notify(empUser, {
+      type: 'cleaning_inspector_assigned',
+      title: 'คุณได้รับมอบหมายเป็นผู้ตรวจรอบทำความสะอาด',
+      body: 'กรุณาตรวจและกรอกชื่อคนทำเมื่อเสร็จ',
+      link: '/cleaning',
+      relatedId: req.params.id,
+    });
+    res.json({ success: true, message: 'เปลี่ยนผู้ตรวจแล้ว' });
+  } catch (e) {
+    console.error('PATCH /cleaning/sessions/:id/inspector error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// Inspector submits the day's report: per-item "who did it" + optional
+// note, plus an overall comment. Only the assigned inspector can call
+// this; HR/owner cannot (they have their own approve/reject step).
+router.post('/cleaning/sessions/:id/inspect', authenticate,
+  auditLog('cleaning_inspect', 'cleaning_sessions'),
+  async (req, res) => {
+  const { items, notes } = req.body;
+  if (!Array.isArray(items)) {
+    return res.status(400).json({ success: false, message: 'รูปแบบข้อมูลไม่ถูกต้อง' });
+  }
+  try {
+    const s = await query('SELECT * FROM cleaning_sessions WHERE id = $1', [req.params.id]);
+    if (!s.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบรอบ' });
+    const session = s.rows[0];
+    if (!['open', 'rejected', 'inspector_reviewed'].includes(session.status)) {
+      return res.status(400).json({ success: false, message: 'สถานะรอบไม่อนุญาตให้แก้ไข' });
+    }
+    // Authorize: only the assigned inspector. Map req.user.id → employees.id.
+    const me = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
+    const myEmpId = me.rows[0]?.id;
+    if (!myEmpId || myEmpId !== session.inspector_id) {
+      return res.status(403).json({ success: false, message: 'เฉพาะผู้ตรวจของรอบนี้เท่านั้น' });
+    }
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const it of items) {
+        if (!it || !it.itemId) continue;
+        await client.query(
+          `UPDATE cleaning_session_items
+              SET done_by_employee_id = $1, inspector_note = $2
+            WHERE id = $3 AND session_id = $4`,
+          [it.doneByEmployeeId || null, it.note || null, it.itemId, req.params.id]
+        );
+      }
+      await client.query(
+        `UPDATE cleaning_sessions
+            SET status = 'inspector_reviewed',
+                inspector_notes = $1,
+                inspector_completed_at = NOW(),
+                updated_at = NOW()
+          WHERE id = $2`,
+        [notes || null, req.params.id]
+      );
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally { client.release(); }
+
+    notifyManyByRole(['hr', 'owner'], {
+      type: 'cleaning_review_pending',
+      title: 'ผู้ตรวจรายงานรอบทำความสะอาดแล้ว',
+      body: `วันที่ ${session.session_date} รอ HR/เจ้าของอนุมัติ`,
+      link: '/cleaning',
+      relatedId: req.params.id,
+    });
+    res.json({ success: true, message: 'ส่งรายงานแล้ว รอ HR/เจ้าของอนุมัติ' });
+  } catch (e) {
+    console.error('POST /cleaning/sessions/:id/inspect error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.post('/cleaning/sessions/:id/approve', authenticate, authorize('hr', 'owner'),
+  auditLog('cleaning_approve', 'cleaning_sessions'),
+  async (req, res) => {
+  const { hrNotes } = req.body;
+  try {
+    const s = await query('SELECT * FROM cleaning_sessions WHERE id = $1', [req.params.id]);
+    if (!s.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบรอบ' });
+    const session = s.rows[0];
+    if (session.status !== 'inspector_reviewed') {
+      return res.status(400).json({ success: false, message: 'รอบนี้ยังไม่ได้รับการตรวจจากผู้ตรวจ' });
+    }
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE cleaning_sessions
+            SET status = 'approved',
+                approved_by = $1, approved_at = NOW(),
+                hr_notes = $2, updated_at = NOW()
+          WHERE id = $3`,
+        [req.user.id, hrNotes || null, req.params.id]
+      );
+      // Advance the queue pointer modulo active-queue length.
+      const qLen = await client.query(
+        `SELECT COUNT(*)::int AS n FROM cleaning_inspector_queue q
+           JOIN employees e ON q.employee_id = e.id
+          WHERE q.is_active = true AND e.is_active = true`
+      );
+      const len = qLen.rows[0]?.n || 0;
+      if (len > 0) {
+        await client.query(
+          `UPDATE cleaning_queue_pointer
+              SET next_position = ((next_position + 1) % $1),
+                  updated_at = NOW()
+            WHERE id = 1`,
+          [len]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (txErr) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw txErr;
+    } finally { client.release(); }
+
+    if (session.inspector_id) {
+      const inspectorUser = await userIdFromEmployee(session.inspector_id);
+      notify(inspectorUser, {
+        type: 'cleaning_approved',
+        title: 'รอบทำความสะอาดได้รับอนุมัติ',
+        body: `วันที่ ${session.session_date}${hrNotes ? ' · ' + hrNotes : ''}`,
+        link: '/cleaning',
+        relatedId: req.params.id,
+      });
+    }
+    res.json({ success: true, message: 'อนุมัติแล้ว' });
+  } catch (e) {
+    console.error('POST /cleaning/sessions/:id/approve error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.post('/cleaning/sessions/:id/reject', authenticate, authorize('hr', 'owner'),
+  auditLog('cleaning_reject', 'cleaning_sessions'),
+  async (req, res) => {
+  const { hrNotes } = req.body;
+  try {
+    const s = await query('SELECT * FROM cleaning_sessions WHERE id = $1', [req.params.id]);
+    if (!s.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบรอบ' });
+    const session = s.rows[0];
+    if (session.status !== 'inspector_reviewed') {
+      return res.status(400).json({ success: false, message: 'รอบนี้ยังไม่ได้รับการตรวจจากผู้ตรวจ' });
+    }
+    await query(
+      `UPDATE cleaning_sessions
+          SET status = 'rejected',
+              hr_notes = $1, updated_at = NOW()
+        WHERE id = $2`,
+      [hrNotes || null, req.params.id]
+    );
+    if (session.inspector_id) {
+      const inspectorUser = await userIdFromEmployee(session.inspector_id);
+      notify(inspectorUser, {
+        type: 'cleaning_rejected',
+        title: 'รอบทำความสะอาดถูกตีกลับ',
+        body: hrNotes ? `เหตุผล: ${hrNotes}` : 'กรุณาแก้ไขและส่งใหม่',
+        link: '/cleaning',
+        relatedId: req.params.id,
+      });
+    }
+    res.json({ success: true, message: 'ตีกลับแล้ว' });
+  } catch (e) {
+    console.error('POST /cleaning/sessions/:id/reject error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
 module.exports = router;
