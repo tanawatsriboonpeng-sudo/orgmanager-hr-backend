@@ -8,42 +8,55 @@ const getLeaveTypes = async (req, res) => {
     const result = await query('SELECT * FROM leave_types WHERE is_active = true ORDER BY name');
     res.json({ success: true, data: result.rows });
   } catch (err) {
+    console.error('GET /leave/types error:', err.message);
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
 };
 
 // GET /api/leave/my-quota
+//
+// Old shape: SELECT → if empty, loop N leave_types and INSERT one at a
+// time. Two problems:
+//   1. N+1 queries on cold-start (one INSERT per type)
+//   2. TOCTOU — between the "is empty?" check and the per-row INSERTs,
+//      a concurrent /my-quota for the same employee would also see
+//      empty and start its own loop. ON CONFLICT saved correctness
+//      but both requests wasted work.
+//
+// New shape: one INSERT … SELECT … ON CONFLICT DO NOTHING seeds any
+// missing rows in a single round-trip, then one SELECT returns the
+// full state. Idempotent + race-safe — concurrent callers converge
+// on the same row set without duplicate work. Includes 0-day types
+// so the UI can display every category and let HR set per-employee
+// quotas later.
 const getMyQuota = async (req, res) => {
   try {
     const year = req.query.year || dayjs().year();
     const empResult = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
     if (!empResult.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลพนักงาน' });
+    const empId = empResult.rows[0].id;
+
+    await query(
+      `INSERT INTO leave_quotas (employee_id, leave_type_id, year, total_days, used_days)
+       SELECT $1, lt.id, $2, COALESCE(lt.days_per_year, 0), 0
+         FROM leave_types lt
+        WHERE lt.is_active = true
+       ON CONFLICT (employee_id, leave_type_id, year) DO NOTHING`,
+      [empId, year]
+    );
 
     const result = await query(
       `SELECT lq.*, lt.name as leave_type_name, lt.code
-       FROM leave_quotas lq
-       JOIN leave_types lt ON lq.leave_type_id = lt.id
-       WHERE lq.employee_id = $1 AND lq.year = $2`,
-      [empResult.rows[0].id, year]
+         FROM leave_quotas lq
+         JOIN leave_types lt ON lq.leave_type_id = lt.id
+        WHERE lq.employee_id = $1 AND lq.year = $2
+        ORDER BY lt.name`,
+      [empId, year]
     );
-
-    // ถ้ายังไม่มี quota สร้างจาก leave_types default — รวม 0-day types
-    // ด้วย เพื่อให้พนักงานเห็น category ครบและ HR ตั้ง quota รายคนได้
-    if (result.rows.length === 0) {
-      const types = await query('SELECT * FROM leave_types WHERE is_active = true');
-      const quotaRows = [];
-      for (const lt of types.rows) {
-        const r = await query(
-          'INSERT INTO leave_quotas (employee_id, leave_type_id, year, total_days) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING RETURNING *',
-          [empResult.rows[0].id, lt.id, year, lt.days_per_year || 0]
-        );
-        if (r.rows[0]) quotaRows.push({ ...r.rows[0], leave_type_name: lt.name, code: lt.code });
-      }
-      return res.json({ success: true, data: quotaRows });
-    }
 
     res.json({ success: true, data: result.rows });
   } catch (err) {
+    console.error('GET /leave/my-quota error:', err.message);
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
 };
@@ -264,6 +277,7 @@ const createRequest = async (req, res) => {
       data: { ...result.rows[0], daysCount }
     });
   } catch (err) {
+    console.error('POST /leave/request error:', err.message);
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
 };
@@ -288,6 +302,7 @@ const getPending = async (req, res) => {
     );
     res.json({ success: true, data: result.rows });
   } catch (err) {
+    console.error('GET /leave/pending error:', err.message);
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
 };
@@ -440,6 +455,7 @@ const getMyHistory = async (req, res) => {
     );
     res.json({ success: true, data: result.rows });
   } catch (err) {
+    console.error('GET /leave/my-history error:', err.message);
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
 };
@@ -471,6 +487,7 @@ const cancelRequest = async (req, res) => {
     );
     res.json({ success: true, message: 'ยกเลิกคำขอลาแล้ว' });
   } catch (err) {
+    console.error('POST /leave/:id/cancel error:', err.message);
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
 };

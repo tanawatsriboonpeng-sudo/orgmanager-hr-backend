@@ -1130,10 +1130,19 @@ router.post('/employees/create', authenticate, authorize('hr','owner'),
   const {firstName,lastName,email,employeeId,position,positionId,department,role,shiftType,baseSalary,password} = req.body
   if (!firstName||!lastName||!email||!employeeId||!password)
     return res.status(400).json({success:false,message:'กรุณากรอกข้อมูลให้ครบ'})
+  // Wrap the two INSERTs (users + employees) plus the quota auto-seed
+  // in a single transaction. Without this, a duplicate employee_id on
+  // the employees INSERT would leave an orphaned users row behind —
+  // login enabled, no employee record, no way for the UI to surface
+  // the broken state. Quota seed stays inside so a partial create
+  // can never leave a half-set-up account in production.
+  const client = await pool.connect()
   try {
     const bcrypt = require('bcryptjs')
     const hash = await bcrypt.hash(password,12)
-    const deptRes = await query('SELECT id FROM departments WHERE name=$1',[department])
+    await client.query('BEGIN')
+
+    const deptRes = await client.query('SELECT id FROM departments WHERE name=$1',[department])
     const deptId = deptRes.rows[0]?.id||null
     // positionId wins over the freeform position string — when given, we
     // overwrite the text with the canonical position name so the two
@@ -1142,31 +1151,42 @@ router.post('/employees/create', authenticate, authorize('hr','owner'),
     let finalPositionId = null
     let finalPosition = position || null
     if (positionId) {
-      const pRes = await query('SELECT name FROM positions WHERE id=$1', [positionId])
-      if (!pRes.rows[0]) return res.status(400).json({success:false, message:'ตำแหน่งที่เลือกไม่พบ'})
+      const pRes = await client.query('SELECT name FROM positions WHERE id=$1', [positionId])
+      if (!pRes.rows[0]) {
+        await client.query('ROLLBACK')
+        return res.status(400).json({success:false, message:'ตำแหน่งที่เลือกไม่พบ'})
+      }
       finalPositionId = positionId
       finalPosition = pRes.rows[0].name
     }
-    const uRes = await query('INSERT INTO users(employee_id,email,password_hash,role) VALUES($1,$2,$3,$4) RETURNING id',[employeeId,email.toLowerCase(),hash,role||'employee'])
-    const empRes = await query('INSERT INTO employees(user_id,employee_id,first_name,last_name,department_id,position,position_id,shift_type,base_salary,start_date) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,CURRENT_DATE) RETURNING id',[uRes.rows[0].id,employeeId,firstName,lastName,deptId,finalPosition,finalPositionId,shiftType||'normal',baseSalary||0])
+    const uRes = await client.query('INSERT INTO users(employee_id,email,password_hash,role) VALUES($1,$2,$3,$4) RETURNING id',[employeeId,email.toLowerCase(),hash,role||'employee'])
+    const empRes = await client.query('INSERT INTO employees(user_id,employee_id,first_name,last_name,department_id,position,position_id,shift_type,base_salary,start_date) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,CURRENT_DATE) RETURNING id',[uRes.rows[0].id,employeeId,firstName,lastName,deptId,finalPosition,finalPositionId,shiftType||'normal',baseSalary||0])
     // Auto-seed leave quotas for the new hire's current calendar year so
     // they show up on /leave's team-quota table immediately — without
     // this HR has to remember to seed manually every time. Skip the
     // owner role (owner has no quota row anywhere else in the system).
+    // Inside the same TX so a seed failure doesn't strand a
+    // half-set-up account.
     if ((role || 'employee') !== 'owner') {
-      await query(
+      await client.query(
         `INSERT INTO leave_quotas (employee_id, leave_type_id, year, total_days, used_days)
          SELECT $1, lt.id, EXTRACT(YEAR FROM CURRENT_DATE)::int, lt.days_per_year, 0
            FROM leave_types lt
           WHERE lt.is_active = true
          ON CONFLICT (employee_id, leave_type_id, year) DO NOTHING`,
         [empRes.rows[0].id]
-      ).catch(err => console.error('[leave] auto-seed quotas for new employee failed:', err.message))
+      )
     }
+
+    await client.query('COMMIT')
     res.status(201).json({success:true,message:`สร้างบัญชี ${firstName} ${lastName} สำเร็จ`})
   } catch(err) {
+    await client.query('ROLLBACK').catch(() => {})
     if(err.code==='23505') return res.status(400).json({success:false,message:'อีเมลหรือรหัสพนักงานซ้ำในระบบ'})
+    console.error('POST /employees/create error:', err.message)
     res.status(500).json({success:false,message:'เกิดข้อผิดพลาด'})
+  } finally {
+    client.release()
   }
 })
 
@@ -1436,8 +1456,32 @@ router.patch('/employees/:id/toggle-active', authenticate, authorize('owner'),
       }
     }
 
-    await query('UPDATE employees SET is_active=$1 WHERE id=$2',[active,req.params.id])
-    await query('UPDATE users SET is_active=$1 WHERE id=$2',[active,target.user_id])
+    // Atomic flip: both rows or neither. Without the transaction the
+    // second UPDATE could fail (FK / connection drop) and leave
+    // employees.is_active out of sync with users.is_active — half-
+    // disabled accounts that could still log in but had no employee
+    // row, or vice versa. Notify + suspend-time refresh-token revoke
+    // happen AFTER commit so a failed write doesn't trigger them.
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query('UPDATE employees SET is_active=$1 WHERE id=$2',[active,req.params.id])
+      await client.query('UPDATE users SET is_active=$1 WHERE id=$2',[active,target.user_id])
+      // When suspending, kill outstanding refresh tokens so any
+      // existing sessions can't keep working until their access tokens
+      // expire (up to 8h). Done in-tx so a commit guarantees they're
+      // wiped together with the is_active flip.
+      if (!active) {
+        await client.query('DELETE FROM refresh_tokens WHERE user_id = $1', [target.user_id])
+      }
+      await client.query('COMMIT')
+    } catch (txErr) {
+      await client.query('ROLLBACK').catch(() => {})
+      console.error('toggle-active TX failed:', txErr.message)
+      return res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' })
+    } finally {
+      client.release()
+    }
 
     // Tell the affected user. When disabling they'll get this in the
     // bell on their next login attempt (assuming they ever come back);
@@ -1450,7 +1494,10 @@ router.patch('/employees/:id/toggle-active', authenticate, authorize('owner'),
     });
 
     res.json({success:true,message:active?'เปิดใช้งานแล้ว':'ระงับบัญชีแล้ว'})
-  } catch(err){res.status(500).json({success:false,message:'เกิดข้อผิดพลาด'})}
+  } catch(err){
+    console.error('toggle-active error:', err.message)
+    res.status(500).json({success:false,message:'เกิดข้อผิดพลาด'})
+  }
 })
 
 router.patch('/employees/:id/reset-password', authenticate, authorize('hr','owner'),
