@@ -77,6 +77,10 @@ router.put('/leave/quotas',
   authenticate, authorize('hr', 'owner'),
   auditLog('leave_quota_set', 'leave_quotas'),
   leaveCtrl.setQuota);
+router.post('/leave/quotas/seed-defaults',
+  authenticate, authorize('hr', 'owner'),
+  auditLog('leave_quota_seed_defaults', 'leave_quotas'),
+  leaveCtrl.seedDefaultQuotas);
 router.get('/leave/my-history', authenticate, leaveCtrl.getMyHistory);
 router.get('/leave/all-requests', authenticate, authorize('hr', 'owner'), leaveCtrl.getAllRequests);
 router.post('/leave/request', authenticate, leaveCtrl.createRequest);

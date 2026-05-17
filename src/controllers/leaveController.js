@@ -589,6 +589,44 @@ const setQuota = async (req, res) => {
   }
 };
 
+/* ===== BULK SEED (HR/owner one-click "give everyone their defaults") ===== */
+
+// POST /api/leave/quotas/seed-defaults
+// Body: { year? }   (defaults to current year)
+// For every active employee × active leave_type with days_per_year > 0,
+// INSERT a quota row using the type's default. Skips rows that already
+// exist (ON CONFLICT DO NOTHING) so calling this repeatedly is safe —
+// it only fills gaps. Returns the count we created.
+const seedDefaultQuotas = async (req, res) => {
+  const year = parseInt(req.body?.year, 10) || dayjs().year();
+  try {
+    const r = await query(
+      `INSERT INTO leave_quotas (employee_id, leave_type_id, year, total_days, used_days)
+       SELECT e.id, lt.id, $1, lt.days_per_year, 0
+         FROM employees e
+         JOIN users u ON e.user_id = u.id
+        CROSS JOIN leave_types lt
+        WHERE e.is_active = true
+          AND u.role <> 'owner'
+          AND lt.is_active = true
+          AND lt.days_per_year > 0
+       ON CONFLICT (employee_id, leave_type_id, year) DO NOTHING
+       RETURNING id`,
+      [year]
+    );
+    res.json({
+      success: true,
+      data: { year, created: r.rowCount || 0 },
+      message: r.rowCount
+        ? `สร้างโควตาเริ่มต้น ${r.rowCount} แถวสำหรับปี ${year + 543}`
+        : `ทุกคนมีโควตาครบแล้วสำหรับปี ${year + 543}`,
+    });
+  } catch (err) {
+    console.error('POST /leave/quotas/seed-defaults error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
 /* ===== ADMIN-RECORD (HR/owner backdate leave for employee) ===== */
 
 // POST /api/leave/admin-record
@@ -717,7 +755,7 @@ const adminCreateLeave = async (req, res) => {
 module.exports = {
   getLeaveTypes, getAllLeaveTypes,
   createLeaveType, updateLeaveType, deleteLeaveType,
-  getMyQuota, getAllQuotas, setQuota,
+  getMyQuota, getAllQuotas, setQuota, seedDefaultQuotas,
   createRequest, getPending, approveRequest, getMyHistory, cancelRequest,
   getAllRequests, adminCreateLeave,
 };
