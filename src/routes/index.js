@@ -1753,66 +1753,76 @@ router.post('/payroll/bulk-generate', authenticate, authorize('hr', 'owner'),
   const endDateStr = `${y}-${String(m).padStart(2, '0')}-${String(endDate.getDate()).padStart(2, '0')}`;
 
   try {
-    // Pull every active non-owner employee with a base_salary.
-    const empRows = await query(
-      `SELECT e.id, e.base_salary
-       FROM employees e
-       LEFT JOIN users u ON e.user_id = u.id
-       WHERE e.is_active = true
-         AND (u.role IS NULL OR u.role <> 'owner')
-         AND e.base_salary IS NOT NULL`
+    // Previously this did 4 queries per employee (eligibility, dup-check,
+    // attendance, OT, then INSERT) — 4N round trips for N people. On
+    // Render free tier with N=30+ this routinely cost 3-5 seconds. Now
+    // the whole thing is one INSERT … SELECT with CTEs: eligible roster,
+    // attendance buckets per employee, approved OT sum per employee, and
+    // a final aggregation that computes ot_amount and social_security in
+    // SQL. ON CONFLICT DO NOTHING on the (employee_id, month, year)
+    // unique handles the dup case in one shot — we count "skipped" as
+    // eligible-minus-inserted.
+    const totalRes = await query(
+      `SELECT COUNT(*)::int AS n
+         FROM employees e
+         LEFT JOIN users u ON e.user_id = u.id
+        WHERE e.is_active = true
+          AND (u.role IS NULL OR u.role <> 'owner')
+          AND e.base_salary IS NOT NULL`
     );
+    const eligible = totalRes.rows[0]?.n || 0;
 
-    let created = 0, skipped = 0;
-    for (const emp of empRows.rows) {
-      // Skip if slip already exists for this period.
-      const dup = await query(
-        'SELECT 1 FROM payroll_records WHERE employee_id=$1 AND month=$2 AND year=$3',
-        [emp.id, m, y]
-      );
-      if (dup.rows[0]) { skipped++; continue; }
+    const ins = await query(
+      `WITH eligible AS (
+         SELECT e.id AS employee_id, e.base_salary
+           FROM employees e
+           LEFT JOIN users u ON e.user_id = u.id
+          WHERE e.is_active = true
+            AND (u.role IS NULL OR u.role <> 'owner')
+            AND e.base_salary IS NOT NULL
+       ),
+       att AS (
+         SELECT employee_id,
+                COUNT(*) FILTER (WHERE status IN ('present','late','very_late'))::int AS work_days,
+                COUNT(*) FILTER (WHERE status = 'absent')::int                       AS absent_days,
+                COUNT(*) FILTER (WHERE status IN ('late','very_late'))::int          AS late_count
+           FROM attendance_logs
+          WHERE date BETWEEN $1 AND $2
+          GROUP BY employee_id
+       ),
+       ot AS (
+         SELECT employee_id, COALESCE(SUM(hours),0)::numeric AS ot_hours
+           FROM ot_requests
+          WHERE date BETWEEN $1 AND $2
+            AND status = 'hr_approved'
+          GROUP BY employee_id
+       )
+       INSERT INTO payroll_records (
+         employee_id, month, year,
+         base_salary, ot_amount, social_security,
+         work_days, absent_days, late_count, ot_hours,
+         created_by
+       )
+       SELECT
+         e.employee_id, $3::int, $4::int,
+         e.base_salary,
+         ROUND(COALESCE(ot.ot_hours,0) * (e.base_salary / 240.0) * 1.5, 2)  AS ot_amount,
+         LEAST(ROUND(e.base_salary * 0.05, 2), 750.00)                       AS social_security,
+         COALESCE(att.work_days,   0),
+         COALESCE(att.absent_days, 0),
+         COALESCE(att.late_count,  0),
+         COALESCE(ot.ot_hours,     0),
+         $5
+         FROM eligible e
+         LEFT JOIN att ON att.employee_id = e.employee_id
+         LEFT JOIN ot  ON ot.employee_id  = e.employee_id
+       ON CONFLICT (employee_id, month, year) DO NOTHING
+       RETURNING id`,
+      [startDate, endDateStr, m, y, req.user.id]
+    );
+    const created = ins.rowCount;
+    const skipped = Math.max(0, eligible - created);
 
-      // Attendance buckets for the period.
-      const attRows = await query(
-        `SELECT
-           COUNT(*) FILTER (WHERE status IN ('present','late','very_late'))::int AS work_days,
-           COUNT(*) FILTER (WHERE status = 'absent')::int                       AS absent_days,
-           COUNT(*) FILTER (WHERE status IN ('late','very_late'))::int          AS late_count
-         FROM attendance_logs
-         WHERE employee_id = $1 AND date BETWEEN $2 AND $3`,
-        [emp.id, startDate, endDateStr]
-      );
-      const att = attRows.rows[0] || { work_days: 0, absent_days: 0, late_count: 0 };
-
-      // Approved OT hours for the period (status='hr_approved').
-      const otRows = await query(
-        `SELECT COALESCE(SUM(hours),0)::numeric AS ot_hours
-         FROM ot_requests
-         WHERE employee_id = $1
-           AND date BETWEEN $2 AND $3
-           AND status = 'hr_approved'`,
-        [emp.id, startDate, endDateStr]
-      );
-      const otHours = Number(otRows.rows[0]?.ot_hours || 0);
-
-      const base = Number(emp.base_salary);
-      const otAmount = +(otHours * (base / 240) * 1.5).toFixed(2);
-      const ss = +Math.min(base * 0.05, 750).toFixed(2);
-
-      await query(
-        `INSERT INTO payroll_records (
-           employee_id, month, year,
-           base_salary, ot_amount, social_security,
-           work_days, absent_days, late_count, ot_hours,
-           created_by
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-        [emp.id, m, y,
-         base, otAmount, ss,
-         att.work_days, att.absent_days, att.late_count, otHours,
-         req.user.id]
-      );
-      created++;
-    }
     res.status(201).json({
       success: true,
       message: `สร้างสลิปแล้ว ${created} รายการ (ข้าม ${skipped} ที่มีอยู่แล้ว)`,
