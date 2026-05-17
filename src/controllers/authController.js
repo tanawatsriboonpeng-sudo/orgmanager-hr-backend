@@ -108,6 +108,16 @@ const login = async (req, res) => {
 };
 
 // POST /api/auth/refresh
+//
+// Previously: jwt.verify alone was enough to mint a new access token, so
+// logout (DELETE FROM refresh_tokens) didn't actually revoke anything —
+// any leaked refresh token stayed valid until its 30-day JWT expiry.
+//
+// Now: after JWT signature/expiry passes, we bcrypt.compare the incoming
+// token against every non-expired refresh_tokens row for the user. No
+// match → 401 (token was revoked via logout, password change, etc.).
+// On success we rotate: delete the matched row and insert a new one, so
+// the previous refresh token cannot be replayed.
 const refreshToken = async (req, res) => {
   try {
     const { refreshToken: token } = req.body;
@@ -123,10 +133,30 @@ const refreshToken = async (req, res) => {
       return res.status(401).json({ success: false, message: 'บัญชีไม่พร้อมใช้งาน' });
     }
 
-    const payload = { userId: user.id, role: user.role, employeeId: user.employee_id };
-    const newAccessToken = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
+    const stored = await query(
+      'SELECT id, token_hash FROM refresh_tokens WHERE user_id = $1 AND expires_at > NOW()',
+      [user.id]
+    );
+    let matchedRowId = null;
+    for (const row of stored.rows) {
+      if (await bcrypt.compare(token, row.token_hash)) { matchedRowId = row.id; break; }
+    }
+    if (!matchedRowId) {
+      return res.status(401).json({ success: false, message: 'Refresh token ถูกเพิกถอน' });
+    }
 
-    res.json({ success: true, data: { accessToken: newAccessToken } });
+    const payload = { userId: user.id, role: user.role, employeeId: user.employee_id };
+    const newAccessToken = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '8h' });
+    const newRefreshToken = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d' });
+    const newHash = await bcrypt.hash(newRefreshToken, 8);
+
+    await query('DELETE FROM refresh_tokens WHERE id = $1', [matchedRowId]);
+    await query(
+      'INSERT INTO refresh_tokens (user_id, token_hash, expires_at, device_info, ip_address) VALUES ($1, $2, NOW() + INTERVAL \'30 days\', $3, $4)',
+      [user.id, newHash, req.headers['user-agent']?.substring(0, 200), req.ip]
+    );
+
+    res.json({ success: true, data: { accessToken: newAccessToken, refreshToken: newRefreshToken } });
   } catch (err) {
     res.status(401).json({ success: false, message: 'Refresh token ไม่ถูกต้องหรือหมดอายุ' });
   }
