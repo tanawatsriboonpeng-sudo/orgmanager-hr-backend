@@ -39,6 +39,9 @@ router.get('/attendance/backdate-mine',         authenticate,                   
 router.get('/attendance/backdate-pending',      authenticate, authorize('owner', 'hr'), attendCtrl.getBackdatePending);
 router.post('/attendance/backdate/:id/approve', authenticate, authorize('owner', 'hr'), auditLog('backdate_approve', 'attendance_backdate_requests'), attendCtrl.approveBackdate);
 router.post('/attendance/backdate/:id/reject',  authenticate, authorize('owner', 'hr'), auditLog('backdate_reject',  'attendance_backdate_requests'), attendCtrl.rejectBackdate);
+// Manual trigger for the missing-checkout sweep. Daily-summary also
+// invokes it lazily, so HR usually doesn't need to call this directly.
+router.post('/attendance/sweep-missing-checkouts', authenticate, authorize('owner', 'hr'), attendCtrl.runMissingCheckoutSweep);
 
 // ====== LEAVE ======
 router.get('/leave/types', authenticate, leaveCtrl.getLeaveTypes);

@@ -351,6 +351,16 @@ async function ensureSchema() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_backdate_employee ON attendance_backdate_requests(employee_id, created_at DESC)
     `);
+    // Missing-checkout policy: if an employee checked in but never
+    // tapped เช็คเอาท์ before the day ended, work_hours stays 0 by
+    // default. The sweep endpoint sets missing_checkout=true and writes
+    // a halved work_hours (0.5 × shift length) so the employee gets
+    // partial credit; once the flag is true the sweep skips that row.
+    // Notifications fire to the employee + HR/owner when this happens.
+    await client.query(`
+      ALTER TABLE attendance_logs
+      ADD COLUMN IF NOT EXISTS missing_checkout BOOLEAN DEFAULT false
+    `);
     // Off-site check-in: lets a field/remote employee log a check-in
     // outside the company GPS radius with a reason; HR/owner approves
     // before it counts as a real attendance entry. is_offsite=true rows

@@ -345,6 +345,13 @@ const getToday = async (req, res) => {
 // GET /api/attendance/daily-summary?date=YYYY-MM-DD (HR/Owner only)
 const getDailySummary = async (req, res) => {
   try {
+    // Lazy housekeeping: process any past-day "checked-in but no
+    // check-out" rows before computing the summary, so the work_hours
+    // figures HR sees already reflect the policy. Awaited so the
+    // summary picks up the freshly-written work_hours.
+    await sweepMissingCheckouts().catch(err =>
+      console.error('[daily-summary] sweep failed:', err.message)
+    );
     const date = req.query.date || nowLocal().format('YYYY-MM-DD');
 
     const [total, logs] = await Promise.all([
@@ -858,9 +865,95 @@ const rejectBackdate = async (req, res) => {
   }
 };
 
+/* ===== Missing-checkout sweep ===== */
+// An employee who tapped เช็คอิน but never tapped เช็คเอาท์ before the
+// day ended would otherwise get 0 work hours for the day, and we'd
+// have to investigate manually. Policy: auto-mark such rows with
+// missing_checkout=true and credit them with HALF a day's hours
+// (computed from the shift, default 4). Each newly-marked row fires
+// a notification to the employee + every HR/owner so the negligence
+// is visible. The function is idempotent — already-marked rows are
+// skipped.
+async function sweepMissingCheckouts() {
+  // Pull every row that needs processing in one query. Date filter uses
+  // the local "today" so rows from earlier today (still potentially in
+  // progress) are not swept yet.
+  const today = nowLocal().format('YYYY-MM-DD');
+  const r = await query(
+    `SELECT a.id, a.employee_id, a.date, a.check_in_at,
+            e.shift_type, e.weekly_shifts,
+            CONCAT(e.first_name, ' ', e.last_name) AS emp_name
+       FROM attendance_logs a
+       JOIN employees e ON a.employee_id = e.id
+      WHERE a.check_in_at IS NOT NULL
+        AND a.check_out_at IS NULL
+        AND a.date < $1::date
+        AND (a.missing_checkout IS NULL OR a.missing_checkout = false)
+        AND e.is_active = true`,
+    [today]
+  );
+  let marked = 0;
+  for (const row of r.rows) {
+    // Use the shift configured for that date to know the full workday
+    // length; halve it. Fallback to 8h × 0.5 = 4h.
+    let standardHours = 8;
+    try {
+      const { config } = await resolveShiftConfig(row.employee_id, row.date);
+      if (config?.work_start && config?.work_end) {
+        const m = timeToMin(config.work_end) - timeToMin(config.work_start);
+        if (m > 0) standardHours = m / 60;
+      }
+    } catch { /* keep default */ }
+    const credited = +(standardHours * 0.5).toFixed(2);
+
+    await query(
+      `UPDATE attendance_logs
+          SET missing_checkout = true,
+              work_hours       = $1,
+              updated_at       = NOW()
+        WHERE id = $2`,
+      [credited, row.id]
+    );
+
+    // Notify the employee.
+    const empUserId = await userIdFromEmployee(row.employee_id);
+    notify(empUserId, {
+      type: 'attendance_missing_checkout',
+      title: 'คุณลืมลงเวลาออกงาน',
+      body: `${dayjs(row.date).format('D MMM')} · ระบบหักเวลาทำงานเหลือ ${credited} ชม. (ครึ่งวัน). ถ้าออกจริงหลังจากนี้ ยื่นคำขอลงเวลาย้อนหลังได้`,
+      link: '/attendance',
+      relatedId: row.id,
+    });
+    // Notify all HR + owner once per row so they can spot-check.
+    notifyManyByRole(['hr', 'owner'], {
+      type: 'attendance_missing_checkout_admin',
+      title: `${row.emp_name} ลืมลงเวลาออกงาน`,
+      body: `${dayjs(row.date).format('D MMM')} · ระบบหักเหลือ ${credited} ชม.`,
+      link: '/attendance',
+      relatedId: row.id,
+    });
+    marked++;
+  }
+  return marked;
+}
+
+// POST /api/attendance/sweep-missing-checkouts — HR/owner manual
+// trigger; daily-summary also calls this lazily so the queue stays
+// current without requiring a real cron.
+const runMissingCheckoutSweep = async (req, res) => {
+  try {
+    const count = await sweepMissingCheckouts();
+    res.json({ success: true, message: `ตรวจสอบแล้ว — พบ ${count} รายการที่ลืมลงเวลาออก`, data: { marked: count } });
+  } catch (err) {
+    console.error('POST /attendance/sweep-missing-checkouts error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
 module.exports = {
   checkIn, checkOut, getToday, getDailySummary, getMyHistory, getRecentSummary,
   getOffsitePending, approveOffsite, rejectOffsite,
   createBackdateRequest, getBackdatePending, getMyBackdateRequests,
   approveBackdate, rejectBackdate,
+  runMissingCheckoutSweep, sweepMissingCheckouts,
 };
