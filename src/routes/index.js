@@ -813,6 +813,17 @@ router.post('/announcements/:id/read', authenticate, async (req, res) => {
       'INSERT INTO announcement_reads (announcement_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
       [req.params.id, req.user.id]
     );
+    // Also clear the corresponding bell notification(s). When an
+    // announcement is posted we fan out a notification per target user
+    // with related_id = announcement.id — without this update the bell
+    // badge stayed unread forever because announcement_reads and
+    // notifications were tracked independently.
+    await query(
+      `UPDATE notifications SET read_at = NOW()
+         WHERE user_id = $1 AND type = 'announcement'
+           AND related_id = $2 AND read_at IS NULL`,
+      [req.user.id, req.params.id]
+    );
     res.json({ success: true });
   } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
 });
