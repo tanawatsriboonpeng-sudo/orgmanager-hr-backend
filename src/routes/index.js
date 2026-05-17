@@ -3289,6 +3289,19 @@ router.get('/cleaning/today', authenticate, async (req, res) => {
       } finally { client.release(); }
     }
 
+    // Self-heal: reconcile this session's items against the current
+    // master list. Covers two real cases:
+    //   1. items were added to cleaning_items AFTER today's session
+    //      was created (or before the live-sync deploy landed)
+    //   2. item names/orders were edited and need to refresh
+    // Only touches sessions still in flight (open/rejected) and never
+    // rewrites a row the inspector has already filled — their work
+    // is preserved verbatim. This makes the manual "refresh" button
+    // also catch up missing items, not just re-render.
+    if (session && (session.status === 'open' || session.status === 'rejected')) {
+      await reconcileSessionItems(session.id);
+    }
+
     // Return full detail (matches GET /sessions/:id shape).
     const full = await loadSessionDetail(session.id);
     res.json({ success: true, data: full });
@@ -3297,6 +3310,52 @@ router.get('/cleaning/today', authenticate, async (req, res) => {
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
 });
+
+// Idempotent reconciliation: pull current active master items into the
+// session if missing, refresh display-order/name for unfilled rows, and
+// drop unfilled rows whose master was deactivated. Leaves any row the
+// inspector has touched (done_by_employee_id set or not_done=true)
+// untouched even if the master changed — preserves work in progress.
+async function reconcileSessionItems(sessionId) {
+  // 1. Insert missing master items.
+  await query(
+    `INSERT INTO cleaning_session_items (session_id, item_id, item_name, display_order)
+     SELECT $1, ci.id, ci.name, ci.display_order
+       FROM cleaning_items ci
+      WHERE ci.is_active = true
+        AND NOT EXISTS (
+          SELECT 1 FROM cleaning_session_items si
+           WHERE si.session_id = $1 AND si.item_id = ci.id
+        )`,
+    [sessionId]
+  );
+  // 2. Refresh name/order on unfilled rows in case master was renamed
+  //    or reordered. Filled rows keep their snapshot — the report
+  //    shouldn't suddenly change after the inspector signed off on it.
+  await query(
+    `UPDATE cleaning_session_items si
+        SET item_name = ci.name, display_order = ci.display_order
+       FROM cleaning_items ci
+      WHERE si.session_id = $1
+        AND si.item_id = ci.id
+        AND si.done_by_employee_id IS NULL
+        AND COALESCE(si.not_done, false) = false
+        AND (si.item_name <> ci.name OR si.display_order <> ci.display_order)`,
+    [sessionId]
+  );
+  // 3. Drop unfilled rows whose master was deactivated. Ad-hoc rows
+  //    (item_id IS NULL) are inspector-owned and never auto-removed.
+  await query(
+    `DELETE FROM cleaning_session_items si
+       USING cleaning_items ci
+      WHERE si.session_id = $1
+        AND si.item_id = ci.id
+        AND ci.is_active = false
+        AND si.done_by_employee_id IS NULL
+        AND COALESCE(si.not_done, false) = false`,
+    [sessionId]
+  );
+}
 
 async function loadSessionDetail(sessionId) {
   const s = await query(
