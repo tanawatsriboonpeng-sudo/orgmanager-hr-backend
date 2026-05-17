@@ -1526,6 +1526,36 @@ router.get('/payroll/:id', authenticate, async (req, res) => {
 });
 
 // POST /payroll — HR/owner creates one slip manually.
+// Numeric validation for payroll inputs. Each rule says "if the field is
+// present it must be a finite number, ≥0, and ≤ max". Numeric typos like
+// 100000000000 baht or accidental negative deductions used to flow
+// straight into the DB and produce garbage net_salary (a Postgres
+// GENERATED column) with no way for HR to notice until a slip went out.
+const PAYROLL_NUMERIC_RULES = {
+  baseSalary:       { max: 100_000_000, label: 'เงินเดือนพื้นฐาน' },
+  otAmount:         { max:  10_000_000, label: 'ค่า OT' },
+  bonus:            { max:  50_000_000, label: 'โบนัส' },
+  allowances:       { max:  10_000_000, label: 'ค่าตอบแทนอื่น' },
+  socialSecurity:   { max:     750,     label: 'ประกันสังคม' },
+  incomeTax:        { max:  50_000_000, label: 'ภาษีหัก ณ ที่จ่าย' },
+  otherDeductions:  { max:  10_000_000, label: 'รายการหักอื่น' },
+  workDays:         { max:      31,     label: 'วันทำงาน' },
+  absentDays:       { max:      31,     label: 'วันขาด' },
+  lateCount:        { max:     200,     label: 'จำนวนสาย' },
+  otHours:          { max:     500,     label: 'ชั่วโมง OT' },
+};
+function validatePayrollNumbers(body) {
+  for (const [field, rule] of Object.entries(PAYROLL_NUMERIC_RULES)) {
+    const v = body[field];
+    if (v === undefined || v === null || v === '') continue;
+    const n = Number(v);
+    if (!Number.isFinite(n)) return `${rule.label} ต้องเป็นตัวเลข`;
+    if (n < 0)               return `${rule.label} ต้องไม่ติดลบ`;
+    if (n > rule.max)        return `${rule.label} เกินค่าที่อนุญาต (สูงสุด ${rule.max.toLocaleString()})`;
+  }
+  return null;
+}
+
 router.post('/payroll', authenticate, authorize('hr', 'owner'), async (req, res) => {
   const {
     employeeId, month, year,
@@ -1537,6 +1567,8 @@ router.post('/payroll', authenticate, authorize('hr', 'owner'), async (req, res)
   if (!employeeId || !month || !year || baseSalary === undefined || baseSalary === null) {
     return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบ (employeeId, month, year, baseSalary จำเป็น)' });
   }
+  const numErr = validatePayrollNumbers(req.body);
+  if (numErr) return res.status(400).json({ success: false, message: numErr });
   try {
     const r = await query(
       `INSERT INTO payroll_records (
@@ -1571,6 +1603,8 @@ router.patch('/payroll/:id', authenticate, authorize('hr', 'owner'), async (req,
     workDays, absentDays, lateCount, otHours,
     notes, status,
   } = req.body;
+  const numErr = validatePayrollNumbers(req.body);
+  if (numErr) return res.status(400).json({ success: false, message: numErr });
   try {
     const existing = await query('SELECT status FROM payroll_records WHERE id = $1', [req.params.id]);
     if (!existing.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบสลิป' });
