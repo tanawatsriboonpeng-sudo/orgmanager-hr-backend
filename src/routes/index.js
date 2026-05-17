@@ -853,7 +853,7 @@ router.get('/projects/:id/tasks', authenticate, async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
 });
 
-router.post('/tasks', authenticate, async (req, res) => {
+router.post('/tasks', authenticate, authorize('hr', 'owner'), async (req, res) => {
   try {
     const { projectId, title, description, assigneeId, priority, dueDate, estimatedHours } = req.body;
     const r = await query(
@@ -864,8 +864,22 @@ router.post('/tasks', authenticate, async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
 });
 
+// PATCH ownership check: allow HR/owner, the task's creator, or the
+// assignee (matched via employees.user_id → employees.id). Anyone else
+// gets 403 — previously any authenticated user could mutate any task.
 router.patch('/tasks/:id', authenticate, async (req, res) => {
   try {
+    const cur = await query('SELECT assignee_id, created_by FROM tasks WHERE id = $1', [req.params.id]);
+    if (!cur.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบงาน' });
+    const task = cur.rows[0];
+
+    let allowed = req.user.role === 'hr' || req.user.role === 'owner' || task.created_by === req.user.id;
+    if (!allowed && task.assignee_id) {
+      const me = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
+      if (me.rows[0] && me.rows[0].id === task.assignee_id) allowed = true;
+    }
+    if (!allowed) return res.status(403).json({ success: false, message: 'ไม่มีสิทธิ์แก้ไขงานนี้' });
+
     const { status, progress, notes } = req.body;
     const r = await query(
       'UPDATE tasks SET status = COALESCE($1,status), progress = COALESCE($2,progress), updated_at = NOW() WHERE id = $3 RETURNING *',
