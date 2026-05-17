@@ -2545,14 +2545,20 @@ router.put('/cleaning/inspector-queue', authenticate, authorize('hr', 'owner'),
 // ---- Sessions ----
 // Helper: pick the next eligible inspector from the queue. Returns the
 // employees.id (or null if no eligible person). "Eligible" = queue row
-// active AND the underlying employee still active. We honor the pointer
-// but skip over inactive entries so the queue degrades gracefully.
+// active AND the underlying employee still active AND not the owner —
+// company policy is that the owner does not participate in the cleaning
+// rota (mirrors the same exclusion on /attendance, /ot, /leave). We
+// honor the pointer but skip over inactive entries so the queue degrades
+// gracefully.
 async function pickNextInspector(client) {
   const q = await (client || { query }).query(
     `SELECT q.position, q.employee_id
        FROM cleaning_inspector_queue q
        JOIN employees e ON q.employee_id = e.id
-      WHERE q.is_active = true AND e.is_active = true
+       LEFT JOIN users u ON e.user_id = u.id
+      WHERE q.is_active = true
+        AND e.is_active = true
+        AND (u.role IS NULL OR u.role <> 'owner')
       ORDER BY q.position`
   );
   if (q.rows.length === 0) return { employeeId: null, position: 0 };
@@ -2680,7 +2686,7 @@ async function loadSessionDetail(sessionId) {
   if (!s.rows[0]) return null;
   const items = await query(
     `SELECT i.id, i.item_id, i.item_name, i.display_order,
-            i.done_by_employee_id, i.inspector_note,
+            i.done_by_employee_id, i.inspector_note, i.not_done,
             de.first_name AS done_by_first_name,
             de.last_name  AS done_by_last_name,
             de.nickname   AS done_by_nickname,
@@ -2707,7 +2713,8 @@ router.get('/cleaning/sessions', authenticate, async (req, res) => {
               insp.avatar_url AS inspector_avatar_url,
               (SELECT COUNT(*) FROM cleaning_session_items WHERE session_id = s.id)::int AS item_count,
               (SELECT COUNT(*) FROM cleaning_session_items
-                WHERE session_id = s.id AND done_by_employee_id IS NOT NULL)::int AS filled_count
+                WHERE session_id = s.id
+                  AND (done_by_employee_id IS NOT NULL OR not_done = true))::int AS filled_count
          FROM cleaning_sessions s
          LEFT JOIN employees insp ON s.inspector_id = insp.id
         ORDER BY s.session_date DESC
@@ -2793,11 +2800,18 @@ router.post('/cleaning/sessions/:id/inspect', authenticate,
       await client.query('BEGIN');
       for (const it of items) {
         if (!it || !it.itemId) continue;
+        // notDone is mutually exclusive with doneByEmployeeId — force
+        // the assignee to null when the row is marked skipped so the
+        // two columns never disagree.
+        const notDone = !!it.notDone;
+        const doneBy = notDone ? null : (it.doneByEmployeeId || null);
         await client.query(
           `UPDATE cleaning_session_items
-              SET done_by_employee_id = $1, inspector_note = $2
-            WHERE id = $3 AND session_id = $4`,
-          [it.doneByEmployeeId || null, it.note || null, it.itemId, req.params.id]
+              SET done_by_employee_id = $1,
+                  inspector_note = $2,
+                  not_done = $3
+            WHERE id = $4 AND session_id = $5`,
+          [doneBy, it.note || null, notDone, it.itemId, req.params.id]
         );
       }
       await client.query(
@@ -2851,11 +2865,17 @@ router.post('/cleaning/sessions/:id/approve', authenticate, authorize('hr', 'own
           WHERE id = $3`,
         [req.user.id, hrNotes || null, req.params.id]
       );
-      // Advance the queue pointer modulo active-queue length.
+      // Advance the queue pointer modulo *eligible* queue length —
+      // owner-rows are excluded from the rotation (same filter as
+      // pickNextInspector). Without this, having an owner accidentally
+      // left in the queue would skew the modulus and stall rotation.
       const qLen = await client.query(
         `SELECT COUNT(*)::int AS n FROM cleaning_inspector_queue q
            JOIN employees e ON q.employee_id = e.id
-          WHERE q.is_active = true AND e.is_active = true`
+           LEFT JOIN users u ON e.user_id = u.id
+          WHERE q.is_active = true
+            AND e.is_active = true
+            AND (u.role IS NULL OR u.role <> 'owner')`
       );
       const len = qLen.rows[0]?.n || 0;
       if (len > 0) {

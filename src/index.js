@@ -575,6 +575,14 @@ async function ensureSchema() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_cleaning_session_items_session ON cleaning_session_items(session_id)
     `);
+    // not_done lets the inspector explicitly mark a row as skipped (vs
+    // just "not filled yet"). When true, done_by_employee_id is forced
+    // null. Read as: null/null = ยังไม่กรอก, not_done=true = ไม่ได้ทำ,
+    // done_by set = ทำโดย X.
+    await client.query(`
+      ALTER TABLE cleaning_session_items
+      ADD COLUMN IF NOT EXISTS not_done BOOLEAN DEFAULT false
+    `);
     console.log('🔧 schema check ok');
   } catch (e) {
     console.error('⚠️  schema check failed:', e.message);
