@@ -58,9 +58,14 @@ const getMyQuota = async (req, res) => {
 const getAllQuotas = async (req, res) => {
   try {
     const year = parseInt(req.query.year, 10) || dayjs().year();
+    // Compute remaining_days inline instead of relying on the GENERATED
+    // STORED column — legacy prod DBs were seeded before that column
+    // landed in migrate.js and would 500 here otherwise. The arithmetic
+    // is trivial and keeps backwards-compat with both schemas.
     const result = await query(
       `SELECT lq.id, lq.employee_id, lq.leave_type_id, lq.year,
-              lq.total_days, lq.used_days, lq.remaining_days,
+              lq.total_days, lq.used_days,
+              (COALESCE(lq.total_days, 0) - COALESCE(lq.used_days, 0)) AS remaining_days,
               e.first_name, e.last_name, e.nickname, e.avatar_url,
               e.employee_id AS emp_code, e.position,
               e.start_date, e.hire_date, e.is_active AS emp_is_active,
