@@ -47,6 +47,7 @@ async function purgeOnce() {
     notifications_deleted: 0,
     audit_logs_deleted: 0,
     expired_refresh_tokens_deleted: 0,
+    password_reset_tokens_deleted: 0,
     policy_used: {
       selfie_days: policy.retention_selfie_days,
       attachment_days: policy.retention_attachment_days,
@@ -155,6 +156,20 @@ async function purgeOnce() {
       `DELETE FROM refresh_tokens WHERE expires_at < NOW()`
     );
     summary.expired_refresh_tokens_deleted = r.rowCount || 0;
+  }
+
+  // 7) Password reset tokens — keep 7 days (long enough to debug a
+  //    failed reset, short enough to keep the table tiny). Used/expired
+  //    rows are eligible. Wrapped in catch since the table may not yet
+  //    exist on a partially-migrated DB.
+  try {
+    const r = await query(
+      `DELETE FROM password_reset_tokens WHERE created_at < NOW() - INTERVAL '7 days'`
+    );
+    summary.password_reset_tokens_deleted = r.rowCount || 0;
+  } catch (e) {
+    // Table missing on legacy DB — ensureSchema will create it next boot.
+    summary.password_reset_tokens_deleted = 0;
   }
 
   summary.finished_at = new Date().toISOString();

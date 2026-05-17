@@ -12,6 +12,16 @@ const login = async (req, res) => {
   try {
     const { email, password, role } = req.body;
 
+    // Validate inputs before touching the DB. Without this, a missing or
+    // non-string email crashes at .toLowerCase() and becomes a generic
+    // 500 — confusing for the user and noisy in error logs. We return
+    // the same 401 message we'd give for wrong credentials so a probing
+    // attacker can't distinguish "missing field" from "wrong password".
+    if (typeof email !== 'string' || typeof password !== 'string'
+        || !email.trim() || !password) {
+      return res.status(401).json({ success: false, message: 'อีเมลหรือรหัสผ่านไม่ถูกต้อง' });
+    }
+
     // ดึง user
     const result = await query(
       'SELECT id, email, password_hash, role, is_active, failed_login_count, locked_until, employee_id FROM users WHERE email = $1',
@@ -178,10 +188,18 @@ const logout = async (req, res) => {
 const changePassword = async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
-    if (!newPassword || newPassword.length < 8) {
+    // bcrypt.compare(undefined, hash) throws — guard the inputs before
+    // touching it so a missing field returns a clean 400 instead of 500.
+    if (typeof currentPassword !== 'string' || !currentPassword) {
+      return res.status(400).json({ success: false, message: 'กรุณากรอกรหัสผ่านปัจจุบัน' });
+    }
+    if (typeof newPassword !== 'string' || newPassword.length < 8) {
       return res.status(400).json({ success: false, message: 'รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร' });
     }
     const result = await query('SELECT password_hash FROM users WHERE id = $1', [req.user.id]);
+    if (!result.rows[0]) {
+      return res.status(404).json({ success: false, message: 'ไม่พบบัญชีผู้ใช้' });
+    }
     const isValid = await bcrypt.compare(currentPassword, result.rows[0].password_hash);
     if (!isValid) return res.status(400).json({ success: false, message: 'รหัสผ่านปัจจุบันไม่ถูกต้อง' });
 

@@ -800,7 +800,7 @@ router.get('/holidays', authenticate, async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
 });
 
-router.post('/holidays', authenticate, authorize('hr'), async (req, res) => {
+router.post('/holidays', authenticate, authorize('hr', 'owner'), async (req, res) => {
   try {
     const { name, date, type } = req.body;
     const year = new Date(date).getFullYear();
@@ -812,7 +812,7 @@ router.post('/holidays', authenticate, authorize('hr'), async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
 });
 
-router.delete('/holidays/:id', authenticate, authorize('hr'), async (req, res) => {
+router.delete('/holidays/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
   try {
     await query('DELETE FROM holidays WHERE id = $1', [req.params.id]);
     res.json({ success: true, message: 'ลบวันหยุดแล้ว' });
@@ -1158,7 +1158,7 @@ router.post('/employees/create', authenticate, authorize('hr','owner'),
         `INSERT INTO leave_quotas (employee_id, leave_type_id, year, total_days, used_days)
          SELECT $1, lt.id, EXTRACT(YEAR FROM CURRENT_DATE)::int, lt.days_per_year, 0
            FROM leave_types lt
-          WHERE lt.is_active = true AND lt.days_per_year > 0
+          WHERE lt.is_active = true
          ON CONFLICT (employee_id, leave_type_id, year) DO NOTHING`,
         [empRes.rows[0].id]
       ).catch(err => console.error('[leave] auto-seed quotas for new employee failed:', err.message))
@@ -2378,59 +2378,193 @@ router.delete('/kpi/reviews/:id', authenticate, authorize('hr', 'owner'), async 
 });
 
 // ====== FORGOT PASSWORD / OTP ======
+//
+// DB-backed (was in-memory Map) for three reasons:
+//   1. Map is lost on every Render redeploy / cold-boot
+//   2. multi-instance deployments would only honor OTPs on the
+//      instance that issued them
+//   3. no audit trail / no protection if an attacker peeks the row
+//
+// Stored hashes (sha256) instead of plaintext OTP/token so a DB leak
+// doesn't immediately surrender live one-time secrets. Used + verified
+// timestamps mean we can detect replay; retention sweep prunes the
+// table after 7 days.
 const { sendOTPEmail } = require('../services/emailService')
 const crypto = require('crypto')
-const otpStore = new Map()
+const bcryptPwd = require('bcryptjs')
+
+const OTP_TTL_MS = 10 * 60 * 1000          // 10 minutes
+const OTP_MAX_ATTEMPTS = 5
+const PWD_MIN_LENGTH = 8                    // matches /auth/change-password
+const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex')
 
 router.post('/auth/forgot-password', async (req, res) => {
   const { email } = req.body
-  if (!email) return res.status(400).json({ success: false, message: 'กรุณาระบุอีเมล' })
+  if (typeof email !== 'string' || !email.trim()) {
+    return res.status(400).json({ success: false, message: 'กรุณาระบุอีเมล' })
+  }
+  const emailLc = email.toLowerCase().trim()
   try {
     const result = await query(
       `SELECT u.id, u.email, u.is_active, CONCAT(e.first_name,' ',e.last_name) as full_name
        FROM users u LEFT JOIN employees e ON u.id = e.user_id WHERE u.email = $1`,
-      [email.toLowerCase()])
-    if (!result.rows[0] || !result.rows[0].is_active)
-      return res.json({ success: true, message: 'ถ้าอีเมลนี้มีในระบบ จะได้รับ OTP ทางอีเมล' })
-    const otp = Math.floor(100000 + Math.random() * 900000).toString()
-    const expiresAt = Date.now() + 10 * 60 * 1000
-    otpStore.set(email.toLowerCase(), { otp, userId: result.rows[0].id, expiresAt, attempts: 0 })
+      [emailLc])
+    // Same response either way — never reveal whether the email exists.
+    const okMsg = { success: true, message: 'ถ้าอีเมลนี้มีในระบบ จะได้รับ OTP ทางอีเมล' }
+    if (!result.rows[0] || !result.rows[0].is_active) return res.json(okMsg)
+
+    // crypto.randomInt is uniform and unpredictable; Math.random isn't.
+    // 6-digit zero-padded so codes like 042371 don't collapse to 5 digits.
+    const otp = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0')
+    const otpHash = sha256(otp)
+    const expiresAt = new Date(Date.now() + OTP_TTL_MS)
+
+    // Invalidate previous pending OTPs for this email so an attacker
+    // can't brute-force across multiple requests in parallel.
+    await query(
+      `UPDATE password_reset_tokens
+          SET used_at = NOW()
+        WHERE email = $1 AND used_at IS NULL`,
+      [emailLc]
+    )
+    await query(
+      `INSERT INTO password_reset_tokens
+         (user_id, email, otp_hash, expires_at, ip_address)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [result.rows[0].id, emailLc, otpHash, expiresAt, req.ip || null]
+    )
+
     await sendOTPEmail(result.rows[0].email, result.rows[0].full_name || 'ผู้ใช้งาน', otp)
-    res.json({ success: true, message: 'ส่ง OTP ไปที่อีเมลแล้ว' })
+    res.json(okMsg)
   } catch (err) {
-    console.error('OTP error:', err)
+    console.error('forgot-password error:', err.message)
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด กรุณาลองใหม่' })
   }
 })
 
 router.post('/auth/verify-otp', async (req, res) => {
   const { email, otp } = req.body
-  const stored = otpStore.get(email?.toLowerCase())
-  if (!stored) return res.status(400).json({ success: false, message: 'ไม่พบคำขอ OTP กรุณาขอใหม่' })
-  if (Date.now() > stored.expiresAt) { otpStore.delete(email.toLowerCase()); return res.status(400).json({ success: false, message: 'OTP หมดอายุ กรุณาขอใหม่' }) }
-  stored.attempts++
-  if (stored.attempts > 5) { otpStore.delete(email.toLowerCase()); return res.status(400).json({ success: false, message: 'ลองผิดหลายครั้ง กรุณาขอ OTP ใหม่' }) }
-  if (stored.otp !== otp) return res.status(400).json({ success: false, message: `OTP ไม่ถูกต้อง (เหลือ ${5 - stored.attempts} ครั้ง)` })
-  const resetToken = crypto.randomBytes(32).toString('hex')
-  stored.resetToken = resetToken
-  stored.verified = true
-  res.json({ success: true, message: 'OTP ถูกต้อง', data: { resetToken } })
+  if (typeof email !== 'string' || typeof otp !== 'string') {
+    return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบ' })
+  }
+  const emailLc = email.toLowerCase().trim()
+  try {
+    // Pick the most recent unused OTP for this email; even if forgot-
+    // password was hammered, we invalidated the older ones above.
+    const r = await query(
+      `SELECT id, otp_hash, attempts, expires_at, used_at
+         FROM password_reset_tokens
+        WHERE email = $1 AND used_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [emailLc]
+    )
+    const row = r.rows[0]
+    if (!row) {
+      return res.status(400).json({ success: false, message: 'ไม่พบคำขอ OTP กรุณาขอใหม่' })
+    }
+    if (new Date(row.expires_at) < new Date()) {
+      await query(`UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1`, [row.id])
+      return res.status(400).json({ success: false, message: 'OTP หมดอายุ กรุณาขอใหม่' })
+    }
+    if (row.attempts >= OTP_MAX_ATTEMPTS) {
+      await query(`UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1`, [row.id])
+      return res.status(400).json({ success: false, message: 'ลองผิดหลายครั้ง กรุณาขอ OTP ใหม่' })
+    }
+    // Compare hashes constant-time so an attacker can't time-attack the
+    // OTP digit-by-digit. Both buffers are equal length (sha256 hex = 64).
+    const incomingHash = Buffer.from(sha256(otp), 'hex')
+    const storedHash   = Buffer.from(row.otp_hash, 'hex')
+    const matches = incomingHash.length === storedHash.length
+      && crypto.timingSafeEqual(incomingHash, storedHash)
+    if (!matches) {
+      const r2 = await query(
+        `UPDATE password_reset_tokens SET attempts = attempts + 1 WHERE id = $1 RETURNING attempts`,
+        [row.id]
+      )
+      const left = Math.max(0, OTP_MAX_ATTEMPTS - r2.rows[0].attempts)
+      return res.status(400).json({ success: false, message: `OTP ไม่ถูกต้อง (เหลือ ${left} ครั้ง)` })
+    }
+
+    // Issue the second-stage reset token. Stored hashed too — the client
+    // gets the plaintext token only here, in this single response.
+    const resetToken = crypto.randomBytes(32).toString('hex')
+    await query(
+      `UPDATE password_reset_tokens
+          SET reset_token_hash = $1, verified_at = NOW()
+        WHERE id = $2`,
+      [sha256(resetToken), row.id]
+    )
+    res.json({ success: true, message: 'OTP ถูกต้อง', data: { resetToken } })
+  } catch (err) {
+    console.error('verify-otp error:', err.message)
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' })
+  }
 })
 
 router.post('/auth/reset-password', async (req, res) => {
   const { email, resetToken, newPassword } = req.body
-  if (!email || !resetToken || !newPassword) return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบ' })
-  if (newPassword.length < 6) return res.status(400).json({ success: false, message: 'รหัสผ่านต้องมีอย่างน้อย 6 ตัว' })
-  const stored = otpStore.get(email.toLowerCase())
-  if (!stored || !stored.verified || stored.resetToken !== resetToken)
-    return res.status(400).json({ success: false, message: 'Token ไม่ถูกต้อง กรุณาขอ OTP ใหม่' })
+  if (typeof email !== 'string' || typeof resetToken !== 'string' || typeof newPassword !== 'string') {
+    return res.status(400).json({ success: false, message: 'ข้อมูลไม่ครบ' })
+  }
+  // Same minimum as /auth/change-password — was 6, which gave a way
+  // to bypass the 8-char policy via the reset flow.
+  if (newPassword.length < PWD_MIN_LENGTH) {
+    return res.status(400).json({ success: false, message: `รหัสผ่านต้องมีอย่างน้อย ${PWD_MIN_LENGTH} ตัวอักษร` })
+  }
+  const emailLc = email.toLowerCase().trim()
   try {
-    const bcrypt = require('bcryptjs')
-    const hash = await bcrypt.hash(newPassword, 12)
-    await query('UPDATE users SET password_hash=$1,failed_login_count=0,locked_until=NULL WHERE id=$2', [hash, stored.userId])
-    otpStore.delete(email.toLowerCase())
+    const r = await query(
+      `SELECT id, user_id, reset_token_hash, expires_at, used_at, verified_at
+         FROM password_reset_tokens
+        WHERE email = $1
+          AND used_at IS NULL
+          AND verified_at IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [emailLc]
+    )
+    const row = r.rows[0]
+    if (!row) {
+      return res.status(400).json({ success: false, message: 'Token ไม่ถูกต้อง กรุณาขอ OTP ใหม่' })
+    }
+    if (new Date(row.expires_at) < new Date()) {
+      return res.status(400).json({ success: false, message: 'Token หมดอายุ กรุณาขอ OTP ใหม่' })
+    }
+    const incomingHash = Buffer.from(sha256(resetToken), 'hex')
+    const storedHash   = Buffer.from(row.reset_token_hash || '', 'hex')
+    const matches = storedHash.length > 0
+      && incomingHash.length === storedHash.length
+      && crypto.timingSafeEqual(incomingHash, storedHash)
+    if (!matches) {
+      return res.status(400).json({ success: false, message: 'Token ไม่ถูกต้อง กรุณาขอ OTP ใหม่' })
+    }
+
+    // Re-check the user is still active — between forgot-password and
+    // reset-password, HR/owner could have suspended the account. The
+    // previous Map-based version skipped this check entirely.
+    const userRow = await query('SELECT is_active FROM users WHERE id = $1', [row.user_id])
+    if (!userRow.rows[0] || !userRow.rows[0].is_active) {
+      return res.status(403).json({ success: false, message: 'บัญชีถูกระงับ — ติดต่อ HR' })
+    }
+
+    const hash = await bcryptPwd.hash(newPassword, 12)
+    // Mark the token used INSIDE the same statement set, so a parallel
+    // attempt to reuse the same resetToken finds used_at NOT NULL and
+    // is rejected by the SELECT above.
+    await query(
+      `UPDATE users SET password_hash = $1, failed_login_count = 0, locked_until = NULL WHERE id = $2`,
+      [hash, row.user_id]
+    )
+    await query(`UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1`, [row.id])
+    // Existing sessions should be invalidated when the password changes —
+    // a recovered account's old refresh tokens become dead weight.
+    await query(`DELETE FROM refresh_tokens WHERE user_id = $1`, [row.user_id])
     res.json({ success: true, message: 'เปลี่ยนรหัสผ่านสำเร็จ' })
-  } catch (err) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }) }
+  } catch (err) {
+    console.error('reset-password error:', err.message)
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' })
+  }
 })
 // ====== CLEANING ROSTER ======
 // Shared-responsibility rota. Everyone sees today's list; only the

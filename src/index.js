@@ -494,6 +494,33 @@ async function ensureSchema() {
     await client.query(`
       INSERT INTO org_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING
     `);
+    // Forgot-password / OTP storage. Previously sat in an in-memory Map
+    // which (a) was lost on every restart, (b) couldn't work in a
+    // multi-instance deployment, and (c) had no audit trail. Stored
+    // hashes (sha256), not plaintext, so a DB peek can't immediately
+    // hand an attacker live OTPs. Used rows aren't deleted on success
+    // — `used_at` + `verified_at` are stamped so we can detect replay
+    // and the retention sweep prunes them after 7 days.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS password_reset_tokens (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        email VARCHAR(200) NOT NULL,
+        otp_hash VARCHAR(80) NOT NULL,
+        reset_token_hash VARCHAR(80),
+        attempts INT NOT NULL DEFAULT 0,
+        expires_at TIMESTAMPTZ NOT NULL,
+        verified_at TIMESTAMPTZ,
+        used_at TIMESTAMPTZ,
+        ip_address INET,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_prt_email_expires
+        ON password_reset_tokens (email, expires_at DESC)
+    `);
+
     // Data retention policy. We don't drop the row, only the heavy binary
     // blobs (selfies, attachments) on attendance_logs / backdate requests;
     // notifications + audit_logs do get row-deleted because their core
@@ -748,9 +775,26 @@ app.use((err, req, res, next) => {
   res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาดภายในระบบ' });
 });
 
-app.listen(PORT, async () => {
-  console.log(`🚀 OrgManager HR API - Port: ${PORT}`);
-  await ensureSchema();
-});
+// Wait for schema migrations BEFORE accepting requests. The previous
+// order (listen → then await ensureSchema in the callback) meant the
+// first few requests after a cold boot could hit endpoints whose
+// migrations hadn't applied yet — symptoms: missing-column errors,
+// 500s on freshly-added fields. Migrating first costs ~1-2s at boot
+// but guarantees every request sees the current schema.
+//
+// If ensureSchema throws (corrupt migration, DB unreachable), we exit
+// non-zero so Render's health check restarts us instead of silently
+// running with a broken schema.
+(async () => {
+  try {
+    await ensureSchema();
+  } catch (err) {
+    console.error('FATAL: ensureSchema failed; refusing to start:', err);
+    process.exit(1);
+  }
+  app.listen(PORT, () => {
+    console.log(`🚀 OrgManager HR API - Port: ${PORT}`);
+  });
+})();
 
 module.exports = app;

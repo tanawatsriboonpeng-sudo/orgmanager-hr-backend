@@ -85,7 +85,6 @@ const getAllQuotas = async (req, res) => {
             WHERE e.is_active = true
               AND u.role <> 'owner'
               AND lt.is_active = true
-              AND lt.days_per_year > 0
            ON CONFLICT (employee_id, leave_type_id, year) DO NOTHING`,
           [year]
         ).catch(err => console.error('[leave] lazy seed in getAllQuotas failed:', err.message));
@@ -129,14 +128,27 @@ const getAllQuotas = async (req, res) => {
 // attendance selfie / backdate attachment paths.
 const MAX_DOCUMENT_BYTES = 2 * 1024 * 1024;
 
+// Maximum days a single leave can span. A year of leave is already
+// absurd in practice; this guards against a far-future endDate
+// (e.g. 9999-12-31) that would otherwise make the loop iterate
+// millions of times and pin the CPU. Callers must validate the result
+// is positive — a clamped 0 means "too long; tell the user".
+const MAX_LEAVE_SPAN_DAYS = 366;
+
 // Walk the date range and count working days (Mon–Fri). Pulled out of
 // createRequest so adminCreateLeave can reuse it without duplicating the
-// loop.
+// loop. Returns 0 when the span exceeds MAX_LEAVE_SPAN_DAYS so callers
+// can surface a clean validation error rather than letting the server
+// burn CPU on an abusive payload.
 function countWorkingDays(start, end) {
+  const startD = dayjs(start);
+  const endD = dayjs(end);
+  if (!startD.isValid() || !endD.isValid()) return 0;
+  const span = endD.diff(startD, 'day');
+  if (span < 0 || span > MAX_LEAVE_SPAN_DAYS) return 0;
   let n = 0;
-  let cur = dayjs(start);
-  const last = dayjs(end);
-  while (!cur.isAfter(last)) {
+  let cur = startD;
+  while (!cur.isAfter(endD)) {
     if (cur.day() !== 0 && cur.day() !== 6) n++;
     cur = cur.add(1, 'day');
   }
@@ -501,6 +513,25 @@ const createLeaveType = async (req, res) => {
         !!requiresDocument,
       ]
     );
+    // Auto-seed leave_quotas for the new type across every active non-
+    // owner employee for the current year so the team-quota table on
+    // /leave shows the new column populated immediately. Without this,
+    // adding a new leave type would create an empty column (all cells
+    // showing "+") until HR manually clicked each one. Even types with
+    // days_per_year = 0 are seeded (rows exist with total = 0) so the
+    // column renders the actual 0/0 value rather than the unfilled "+"
+    // placeholder.
+    const newTypeId = r.rows[0].id;
+    await query(
+      `INSERT INTO leave_quotas (employee_id, leave_type_id, year, total_days, used_days)
+       SELECT e.id, $1, EXTRACT(YEAR FROM CURRENT_DATE)::int, $2, 0
+         FROM employees e
+         JOIN users u ON e.user_id = u.id
+        WHERE e.is_active = true
+          AND u.role <> 'owner'
+       ON CONFLICT (employee_id, leave_type_id, year) DO NOTHING`,
+      [newTypeId, r.rows[0].days_per_year || 0]
+    ).catch(err => console.error('[leave] auto-seed quotas for new type failed:', err.message));
     res.status(201).json({ success: true, data: r.rows[0] });
   } catch (err) {
     if (err.code === '23505') {
@@ -634,8 +665,8 @@ const setQuota = async (req, res) => {
 
 // POST /api/leave/quotas/seed-defaults
 // Body: { year? }   (defaults to current year)
-// For every active employee × active leave_type with days_per_year > 0,
-// INSERT a quota row using the type's default. Skips rows that already
+// For every active employee × active leave_type, INSERT a quota row
+// using the type's days_per_year (including 0). Skips rows that already
 // exist (ON CONFLICT DO NOTHING) so calling this repeatedly is safe —
 // it only fills gaps. Returns the count we created.
 const seedDefaultQuotas = async (req, res) => {
@@ -650,7 +681,6 @@ const seedDefaultQuotas = async (req, res) => {
         WHERE e.is_active = true
           AND u.role <> 'owner'
           AND lt.is_active = true
-          AND lt.days_per_year > 0
        ON CONFLICT (employee_id, leave_type_id, year) DO NOTHING
        RETURNING id`,
       [year]
