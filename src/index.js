@@ -381,6 +381,23 @@ async function ensureSchema() {
       ALTER TABLE attendance_logs
       ADD COLUMN IF NOT EXISTS admin_note TEXT
     `);
+    // LINE account link. Set once via /auth/line-link (employee already
+    // logged in via email) or as a side effect of /auth/line-login when
+    // the employee supplies email+password for the first-time pairing.
+    // UNIQUE so one LINE userId can't bind to multiple accounts.
+    await client.query(`
+      ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS line_user_id VARCHAR(50)
+    `);
+    await client.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'users_line_user_id_unique'
+        ) THEN
+          ALTER TABLE users ADD CONSTRAINT users_line_user_id_unique UNIQUE (line_user_id);
+        END IF;
+      END $$;
+    `);
     // Off-site check-in: lets a field/remote employee log a check-in
     // outside the company GPS radius with a reason; HR/owner approves
     // before it counts as a real attendance entry. is_offsite=true rows
@@ -587,14 +604,6 @@ async function ensureSchema() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_cleaning_session_items_session ON cleaning_session_items(session_id)
     `);
-    // not_done lets the inspector explicitly mark a row as skipped (vs
-    // just "not filled yet"). When true, done_by_employee_id is forced
-    // null. Read as: null/null = ยังไม่กรอก, not_done=true = ไม่ได้ทำ,
-    // done_by set = ทำโดย X.
-    await client.query(`
-      ALTER TABLE cleaning_session_items
-      ADD COLUMN IF NOT EXISTS not_done BOOLEAN DEFAULT false
-    `);
     // ====== OFFICE LOCATIONS ======
     // Replaces the single-point COMPANY_LAT/LNG/CHECKIN_RADIUS_METERS env
     // vars with an owner-managed list of allowed check-in spots. Each
@@ -612,6 +621,14 @@ async function ensureSchema() {
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
       )
+    `);
+    // not_done lets the inspector explicitly mark a row as skipped (vs
+    // just "not filled yet"). When true, done_by_employee_id is forced
+    // null. Read as: null/null = ยังไม่กรอก, not_done=true = ไม่ได้ทำ,
+    // done_by set = ทำโดย X.
+    await client.query(`
+      ALTER TABLE cleaning_session_items
+      ADD COLUMN IF NOT EXISTS not_done BOOLEAN DEFAULT false
     `);
     console.log('🔧 schema check ok');
   } catch (e) {

@@ -211,4 +211,191 @@ const getMe = async (req, res) => {
   }
 };
 
-module.exports = { login, logout, refreshToken, changePassword, getMe };
+/* ===== LINE Login (LIFF integration) ===== */
+// Mirrors /auth/login's JWT contract so the frontend can use the same
+// token storage + axios interceptors. The verification flow:
+//   1. LIFF gives us a LINE access_token (client-side, after liff.login()).
+//   2. Backend hits LINE's verify endpoint to confirm the token is
+//      valid AND was minted for OUR channel (defends against an
+//      attacker sending a token from a different LINE app).
+//   3. Fetch the LINE profile to get the immutable userId.
+//   4. Look up users.line_user_id. If found → mint JWTs.
+//      If not + email/password supplied → verify those, link the LINE
+//      userId to the matching account, mint JWTs.
+//      If not + no credentials → 404 so the frontend can prompt linking.
+async function verifyLineToken(accessToken) {
+  const expectedChannelId = process.env.LINE_LOGIN_CHANNEL_ID;
+  if (!expectedChannelId) {
+    throw Object.assign(new Error('LINE_LOGIN_CHANNEL_ID env var missing'), { status: 500 });
+  }
+  const verifyRes = await fetch(
+    'https://api.line.me/oauth2/v2.1/verify?access_token=' + encodeURIComponent(accessToken)
+  );
+  if (!verifyRes.ok) {
+    throw Object.assign(new Error('LINE token verification failed'), { status: 401 });
+  }
+  const verify = await verifyRes.json();
+  // Defend against tokens issued for some other LINE app.
+  if (String(verify.client_id) !== String(expectedChannelId)) {
+    throw Object.assign(new Error('LINE token belongs to a different channel'), { status: 401 });
+  }
+  if (typeof verify.expires_in === 'number' && verify.expires_in <= 0) {
+    throw Object.assign(new Error('LINE token expired'), { status: 401 });
+  }
+  const profileRes = await fetch('https://api.line.me/v2/profile', {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!profileRes.ok) {
+    throw Object.assign(new Error('Failed to fetch LINE profile'), { status: 401 });
+  }
+  return profileRes.json(); // { userId, displayName, pictureUrl?, statusMessage? }
+}
+
+// Shared "issue JWT pair + write refresh token row" used by both
+// password login and LINE login. Returns the same response shape the
+// frontend already consumes.
+async function issueTokensAndRespond(res, req, user) {
+  await query(
+    'UPDATE users SET failed_login_count = 0, locked_until = NULL, last_login_at = NOW() WHERE id = $1',
+    [user.id]
+  );
+  const empResult = await query(
+    `SELECT e.id as emp_id, e.first_name, e.last_name, e.avatar_url, d.name as department
+       FROM employees e LEFT JOIN departments d ON e.department_id = d.id
+      WHERE e.user_id = $1`,
+    [user.id]
+  );
+  const emp = empResult.rows[0];
+
+  const payload = { userId: user.id, role: user.role, employeeId: user.employee_id };
+  const accessToken  = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '8h' });
+  const refreshToken = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d' });
+  const tokenHash = await bcrypt.hash(refreshToken, 8);
+  await query(
+    'INSERT INTO refresh_tokens (user_id, token_hash, expires_at, device_info, ip_address) VALUES ($1, $2, NOW() + INTERVAL \'30 days\', $3, $4)',
+    [user.id, tokenHash, req.headers['user-agent']?.substring(0, 200), req.ip]
+  );
+
+  res.json({
+    success: true,
+    data: {
+      accessToken, refreshToken,
+      user: {
+        id: user.id, email: user.email, role: user.role, employeeId: user.employee_id,
+        firstName: emp?.first_name, lastName: emp?.last_name,
+        fullName: emp ? `${emp.first_name} ${emp.last_name}` : null,
+        avatarUrl: emp?.avatar_url, department: emp?.department,
+      }
+    }
+  });
+}
+
+// POST /api/auth/line-login
+// Body: { lineAccessToken, email?, password? }
+//   - First call from a linked account: just lineAccessToken; we
+//     resolve users via line_user_id and mint JWTs.
+//   - First-ever call from a not-yet-linked account: must include
+//     email + password; we verify credentials and link line_user_id.
+const lineLogin = async (req, res) => {
+  try {
+    const { lineAccessToken, email, password } = req.body;
+    if (!lineAccessToken) {
+      return res.status(400).json({ success: false, message: 'กรุณาส่ง LINE access token' });
+    }
+    let profile;
+    try { profile = await verifyLineToken(lineAccessToken); }
+    catch (e) { return res.status(e.status || 401).json({ success: false, message: e.message }); }
+
+    const lineUserId = profile.userId;
+    const linked = await query(
+      'SELECT id, email, role, employee_id, is_active FROM users WHERE line_user_id = $1',
+      [lineUserId]
+    );
+    if (linked.rows[0]) {
+      const user = linked.rows[0];
+      if (!user.is_active) return res.status(403).json({ success: false, message: 'บัญชีถูกระงับการใช้งาน' });
+      return issueTokensAndRespond(res, req, user);
+    }
+
+    // Not yet linked. Need email+password to bind this LINE userId to a
+    // real account. Frontend should detect this 404 and show a small
+    // "ผูกบัญชี" form.
+    if (!email || !password) {
+      return res.status(404).json({
+        success: false,
+        code: 'LINE_NOT_LINKED',
+        message: 'บัญชี LINE นี้ยังไม่ได้ผูกกับพนักงาน — กรุณากรอกอีเมล/รหัสผ่านเพื่อผูก',
+        data: { lineDisplayName: profile.displayName, linePictureUrl: profile.pictureUrl },
+      });
+    }
+
+    const passRes = await query(
+      'SELECT id, email, password_hash, role, is_active, employee_id FROM users WHERE email = $1',
+      [email.toLowerCase().trim()]
+    );
+    const candidate = passRes.rows[0];
+    if (!candidate || !candidate.is_active) {
+      return res.status(401).json({ success: false, message: 'อีเมลหรือรหัสผ่านไม่ถูกต้อง' });
+    }
+    if (!(await bcrypt.compare(password, candidate.password_hash))) {
+      return res.status(401).json({ success: false, message: 'อีเมลหรือรหัสผ่านไม่ถูกต้อง' });
+    }
+    try {
+      await query('UPDATE users SET line_user_id = $1 WHERE id = $2', [lineUserId, candidate.id]);
+    } catch (err) {
+      // 23505 = unique violation; means this LINE id raced and got
+      // linked elsewhere in between.
+      if (err.code === '23505') {
+        return res.status(409).json({ success: false, message: 'บัญชี LINE นี้ถูกใช้กับบัญชีอื่นแล้ว' });
+      }
+      throw err;
+    }
+    return issueTokensAndRespond(res, req, candidate);
+  } catch (err) {
+    console.error('LINE login error:', err);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
+// POST /api/auth/line-link  (must be authenticated via email login first)
+// For the path "I already logged in normally and want to attach my
+// LINE account now". Body: { lineAccessToken }
+const lineLink = async (req, res) => {
+  try {
+    const { lineAccessToken } = req.body;
+    if (!lineAccessToken) {
+      return res.status(400).json({ success: false, message: 'กรุณาส่ง LINE access token' });
+    }
+    let profile;
+    try { profile = await verifyLineToken(lineAccessToken); }
+    catch (e) { return res.status(e.status || 401).json({ success: false, message: e.message }); }
+    try {
+      await query('UPDATE users SET line_user_id = $1 WHERE id = $2', [profile.userId, req.user.id]);
+    } catch (err) {
+      if (err.code === '23505') {
+        return res.status(409).json({ success: false, message: 'บัญชี LINE นี้ถูกใช้กับบัญชีอื่นแล้ว' });
+      }
+      throw err;
+    }
+    res.json({
+      success: true,
+      message: 'ผูกบัญชี LINE แล้ว',
+      data: { lineDisplayName: profile.displayName, linePictureUrl: profile.pictureUrl },
+    });
+  } catch (err) {
+    console.error('LINE link error:', err);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
+// POST /api/auth/line-unlink  (must be authenticated)
+const lineUnlink = async (req, res) => {
+  try {
+    await query('UPDATE users SET line_user_id = NULL WHERE id = $1', [req.user.id]);
+    res.json({ success: true, message: 'ยกเลิกการผูกบัญชี LINE แล้ว' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
+module.exports = { login, logout, refreshToken, changePassword, getMe, lineLogin, lineLink, lineUnlink };
