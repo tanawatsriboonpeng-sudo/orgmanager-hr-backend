@@ -320,6 +320,27 @@ async function ensureSchema() {
          AND status = 'present'
          AND status_detail = 'เกือบสาย'
     `);
+    // Off-site check-in: lets a field/remote employee log a check-in
+    // outside the company GPS radius with a reason; HR/owner approves
+    // before it counts as a real attendance entry. is_offsite=true rows
+    // start with offsite_status='pending'; the status (present/late/etc)
+    // is still computed normally from the shift schedule so HR sees the
+    // would-be bucket when reviewing. Pending rows are still in
+    // attendance_logs but payroll/final stats should treat them as
+    // not-yet-counted by filtering offsite_status='pending'.
+    const offsiteColumns = [
+      ['is_offsite',           'BOOLEAN DEFAULT false'],
+      ['offsite_reason',       'TEXT'],
+      ['offsite_status',       "VARCHAR(20)"],   // 'pending' | 'approved' | 'rejected'
+      ['offsite_approved_by',  'UUID REFERENCES users(id)'],
+      ['offsite_approved_at',  'TIMESTAMPTZ'],
+      ['offsite_reject_reason','TEXT'],
+    ];
+    for (const [name, type] of offsiteColumns) {
+      await client.query(
+        `ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS ${name} ${type}`
+      );
+    }
     // Payroll. Legacy DBs created before migrate.js added payroll_records
     // won't have this table, so create it defensively on every boot.
     // net_salary is a GENERATED column — Postgres recomputes it on every

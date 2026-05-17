@@ -30,6 +30,9 @@ router.get('/attendance/today', authenticate, attendCtrl.getToday);
 router.get('/attendance/my-history', authenticate, attendCtrl.getMyHistory);
 router.get('/attendance/daily-summary', authenticate, authorize('owner', 'hr'), attendCtrl.getDailySummary);
 router.get('/attendance/recent-summary', authenticate, authorize('owner', 'hr'), attendCtrl.getRecentSummary);
+router.get('/attendance/offsite-pending',     authenticate, authorize('owner', 'hr'), attendCtrl.getOffsitePending);
+router.post('/attendance/offsite/:id/approve', authenticate, authorize('owner', 'hr'), auditLog('offsite_approve', 'attendance_logs'), attendCtrl.approveOffsite);
+router.post('/attendance/offsite/:id/reject',  authenticate, authorize('owner', 'hr'), auditLog('offsite_reject',  'attendance_logs'), attendCtrl.rejectOffsite);
 
 // ====== LEAVE ======
 router.get('/leave/types', authenticate, leaveCtrl.getLeaveTypes);

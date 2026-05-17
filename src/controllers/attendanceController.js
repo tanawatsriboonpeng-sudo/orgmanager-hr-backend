@@ -107,7 +107,7 @@ function calcStatus(now, cfg) {
 // POST /api/attendance/check-in
 const checkIn = async (req, res) => {
   try {
-    const { lat, lng, method = 'gps', selfie } = req.body;
+    const { lat, lng, method = 'gps', selfie, offsite, reason } = req.body;
     const today = dayjs().format('YYYY-MM-DD');
     const now = dayjs();
 
@@ -115,6 +115,19 @@ const checkIn = async (req, res) => {
     // quality and keeps the Postgres row well under TOAST thresholds.
     if (selfie && typeof selfie === 'string' && selfie.length > 700 * 1024) {
       return res.status(413).json({ success: false, message: 'รูปเซลฟี่ใหญ่เกินไป (สูงสุด ~500KB)' });
+    }
+
+    // Off-site path: HR/owner approves later; we skip the GPS radius
+    // check but still require a reason and a selfie so there's something
+    // to review. Status is computed normally so HR sees what bucket it
+    // would have landed in; offsite_status='pending' until approved.
+    if (offsite) {
+      if (!reason || !String(reason).trim()) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุเหตุผลที่ลงเวลานอกสถานที่' });
+      }
+      if (!selfie) {
+        return res.status(400).json({ success: false, message: 'กรุณาถ่ายเซลฟี่ประกอบการลงเวลานอกสถานที่' });
+      }
     }
 
     // ดึงข้อมูล employee
@@ -136,16 +149,20 @@ const checkIn = async (req, res) => {
       return res.status(409).json({ success: false, message: 'เช็คอินวันนี้แล้ว' });
     }
 
-    // ตรวจสอบ GPS
+    // ตรวจสอบ GPS — off-site path skips the radius check (the whole
+    // point is to log a check-in from outside), but still records the
+    // distance so HR can see how far the employee was when reviewing.
     let distanceM = null;
-    if (method === 'gps') {
-      if (!lat || !lng) {
-        return res.status(400).json({ success: false, message: 'กรุณาเปิด GPS' });
-      }
+    if (method === 'gps' && lat && lng) {
       distanceM = geolib.getDistance(
         { latitude: lat, longitude: lng },
         { latitude: COMPANY_LAT, longitude: COMPANY_LNG }
       );
+    }
+    if (!offsite && method === 'gps') {
+      if (!lat || !lng) {
+        return res.status(400).json({ success: false, message: 'กรุณาเปิด GPS' });
+      }
       if (distanceM > MAX_RADIUS) {
         return res.status(400).json({
           success: false,
@@ -165,28 +182,41 @@ const checkIn = async (req, res) => {
     const { status, detail, almostLate } = calcStatus(now, shiftCfg);
 
     // บันทึก
+    const offsiteFlag = !!offsite;
+    const offsiteStatus = offsiteFlag ? 'pending' : null;
     const result = await query(
       `INSERT INTO attendance_logs
-        (employee_id, date, check_in_at, check_in_lat, check_in_lng, check_in_distance_m, check_in_method, status, status_detail, check_in_selfie, almost_late)
-       VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7, $8, $9, $10)
+        (employee_id, date, check_in_at, check_in_lat, check_in_lng, check_in_distance_m, check_in_method,
+         status, status_detail, check_in_selfie, almost_late,
+         is_offsite, offsite_reason, offsite_status)
+       VALUES ($1, $2, NOW(), $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        ON CONFLICT (employee_id, date) DO UPDATE SET
         check_in_at = NOW(), check_in_lat = $3, check_in_lng = $4,
         check_in_distance_m = $5, check_in_method = $6, status = $7, status_detail = $8,
         check_in_selfie = COALESCE($9, attendance_logs.check_in_selfie),
         almost_late = $10,
+        is_offsite      = $11,
+        offsite_reason  = COALESCE($12, attendance_logs.offsite_reason),
+        offsite_status  = $13,
         updated_at = NOW()
        RETURNING *`,
-      [emp.id, today, lat, lng, distanceM, method, status, detail, selfie || null, !!almostLate]
+      [emp.id, today, lat, lng, distanceM, method,
+       status, detail, selfie || null, !!almostLate,
+       offsiteFlag, offsiteFlag ? String(reason).trim() : null, offsiteStatus]
     );
 
     res.json({
       success: true,
-      message: `เช็คอินสำเร็จ — ${detail}`,
+      message: offsiteFlag
+        ? 'ส่งคำขอลงเวลานอกสถานที่แล้ว รอ HR/เจ้าของอนุมัติ'
+        : `เช็คอินสำเร็จ — ${detail}`,
       data: {
         checkInAt: result.rows[0].check_in_at,
         status,
         statusDetail: detail,
-        distance: distanceM
+        distance: distanceM,
+        offsite: offsiteFlag,
+        offsiteStatus,
       }
     });
   } catch (err) {
@@ -390,6 +420,89 @@ const getRecentSummary = async (req, res) => {
   }
 };
 
+// GET /api/attendance/offsite-pending — HR/owner queue of off-site
+// check-ins awaiting approval. Joins employee + computes how far they
+// were from the office at submission time so HR can sanity-check the
+// reason.
+const getOffsitePending = async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT a.id, a.date, a.check_in_at, a.check_in_lat, a.check_in_lng,
+              a.check_in_distance_m, a.check_in_selfie, a.status, a.status_detail,
+              a.offsite_reason, a.offsite_status,
+              e.id AS employee_id, e.first_name, e.last_name, e.nickname,
+              e.avatar_url, e.employee_id AS emp_code, e.position,
+              d.name AS department_name
+         FROM attendance_logs a
+         JOIN employees e ON a.employee_id = e.id
+         LEFT JOIN departments d ON e.department_id = d.id
+        WHERE a.is_offsite = true AND a.offsite_status = 'pending'
+        ORDER BY a.check_in_at ASC`
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (err) {
+    console.error('GET /attendance/offsite-pending error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
+// POST /api/attendance/offsite/:id/approve — HR/owner stamps approval.
+// Row stays as a normal attendance_logs entry; only offsite_status flips
+// from 'pending' to 'approved' so payroll/stats can include it.
+const approveOffsite = async (req, res) => {
+  try {
+    const r = await query(
+      `UPDATE attendance_logs
+          SET offsite_status      = 'approved',
+              offsite_approved_by = $1,
+              offsite_approved_at = NOW(),
+              updated_at          = NOW()
+        WHERE id = $2
+          AND is_offsite = true
+          AND offsite_status = 'pending'
+        RETURNING id`,
+      [req.user.id, req.params.id]
+    );
+    if (!r.rows[0]) {
+      return res.status(400).json({ success: false, message: 'อนุมัติได้เฉพาะคำขอที่รออนุมัติ' });
+    }
+    res.json({ success: true, message: 'อนุมัติการลงเวลานอกสถานที่แล้ว' });
+  } catch (err) {
+    console.error('POST /attendance/offsite/:id/approve error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
+// POST /api/attendance/offsite/:id/reject — HR/owner rejects with an
+// optional reason. We keep the row in attendance_logs (status=rejected)
+// rather than deleting so audit history sticks around; payroll/stats
+// filter rejected rows out by checking offsite_status.
+const rejectOffsite = async (req, res) => {
+  try {
+    const { reason } = req.body;
+    const r = await query(
+      `UPDATE attendance_logs
+          SET offsite_status        = 'rejected',
+              offsite_approved_by   = $1,
+              offsite_approved_at   = NOW(),
+              offsite_reject_reason = $2,
+              updated_at            = NOW()
+        WHERE id = $3
+          AND is_offsite = true
+          AND offsite_status = 'pending'
+        RETURNING id`,
+      [req.user.id, reason ? String(reason).trim() : null, req.params.id]
+    );
+    if (!r.rows[0]) {
+      return res.status(400).json({ success: false, message: 'ปฏิเสธได้เฉพาะคำขอที่รออนุมัติ' });
+    }
+    res.json({ success: true, message: 'ปฏิเสธการลงเวลานอกสถานที่แล้ว' });
+  } catch (err) {
+    console.error('POST /attendance/offsite/:id/reject error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+};
+
 // GET /api/attendance/my-history?month=5&year=2025
 const getMyHistory = async (req, res) => {
   try {
@@ -421,4 +534,7 @@ const getMyHistory = async (req, res) => {
   }
 };
 
-module.exports = { checkIn, checkOut, getToday, getDailySummary, getMyHistory, getRecentSummary };
+module.exports = {
+  checkIn, checkOut, getToday, getDailySummary, getMyHistory, getRecentSummary,
+  getOffsitePending, approveOffsite, rejectOffsite,
+};
