@@ -623,9 +623,13 @@ const createBackdateRequest = async (req, res) => {
   if (req.user?.role === 'owner') {
     return res.status(403).json({ success: false, message: 'เจ้าของไม่ต้องยื่นคำขอลงเวลา' });
   }
-  const { date, requestType, checkInTime, checkOutTime, reason } = req.body;
+  const { date, requestType, checkInTime, checkOutTime, reason, attachment } = req.body;
   if (!date || !requestType || !reason || !String(reason).trim()) {
     return res.status(400).json({ success: false, message: 'กรุณาระบุวันที่ ประเภท และเหตุผล' });
+  }
+  // Optional attachment cap — same ~500KB rule as the selfie field.
+  if (attachment && typeof attachment === 'string' && attachment.length > 700 * 1024) {
+    return res.status(413).json({ success: false, message: 'รูปหลักฐานใหญ่เกินไป (สูงสุด ~500KB)' });
   }
   if (!['check_in', 'check_out', 'both'].includes(requestType)) {
     return res.status(400).json({ success: false, message: 'ประเภทคำขอไม่ถูกต้อง' });
@@ -649,12 +653,13 @@ const createBackdateRequest = async (req, res) => {
 
     const r = await query(
       `INSERT INTO attendance_backdate_requests
-         (employee_id, date, request_type, check_in_time, check_out_time, reason)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+         (employee_id, date, request_type, check_in_time, check_out_time, reason, attachment)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
       [empRow.id, date, requestType,
        requestType === 'check_out' ? null : (checkInTime  || null),
        requestType === 'check_in'  ? null : (checkOutTime || null),
-       String(reason).trim()]
+       String(reason).trim(),
+       attachment || null]
     );
 
     // Notify everyone who can approve. The body packs the date + the

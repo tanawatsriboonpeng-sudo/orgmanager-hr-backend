@@ -345,6 +345,14 @@ async function ensureSchema() {
         updated_at      TIMESTAMPTZ DEFAULT NOW()
       )
     `);
+    // Optional evidence image (base64 JPEG dataURL) — e.g. a photo of
+    // a vendor receipt or a meeting room sign that proves the time the
+    // employee is claiming. Added defensively so existing DBs get the
+    // column without a manual migration.
+    await client.query(`
+      ALTER TABLE attendance_backdate_requests
+      ADD COLUMN IF NOT EXISTS attachment TEXT
+    `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_backdate_status ON attendance_backdate_requests(status, date DESC)
     `);
