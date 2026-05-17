@@ -1,6 +1,17 @@
 const { query } = require('../../config/database');
 const geolib = require('geolib');
 const dayjs = require('dayjs');
+// Render runs in UTC by default, so a bare dayjs() returns the wrong
+// hour-of-day for status calculation (the user's 10:18 reads as 03:18
+// at the server and gets bucketed as "ตรงเวลา"). Anchor everything
+// time-of-day-sensitive to Asia/Bangkok via the timezone plugin so the
+// shift thresholds compare against the user's wall-clock time.
+const utc = require('dayjs/plugin/utc');
+const timezone = require('dayjs/plugin/timezone');
+dayjs.extend(utc);
+dayjs.extend(timezone);
+const TZ = process.env.APP_TIMEZONE || 'Asia/Bangkok';
+const nowLocal = () => dayjs().tz(TZ);
 
 const COMPANY_LAT = parseFloat(process.env.COMPANY_LAT || '13.7563');
 const COMPANY_LNG = parseFloat(process.env.COMPANY_LNG || '100.5018');
@@ -108,8 +119,8 @@ function calcStatus(now, cfg) {
 const checkIn = async (req, res) => {
   try {
     const { lat, lng, method = 'gps', selfie, offsite, reason } = req.body;
-    const today = dayjs().format('YYYY-MM-DD');
-    const now = dayjs();
+    const now = nowLocal();
+    const today = now.format('YYYY-MM-DD');
 
     // Selfie size guard. ~500KB cap is enough for a 480px JPEG at ~0.7
     // quality and keeps the Postgres row well under TOAST thresholds.
@@ -229,7 +240,7 @@ const checkIn = async (req, res) => {
 const checkOut = async (req, res) => {
   try {
     const { lat, lng } = req.body;
-    const today = dayjs().format('YYYY-MM-DD');
+    const today = nowLocal().format('YYYY-MM-DD');
 
     const empResult = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
     if (!empResult.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลพนักงาน' });
@@ -243,7 +254,7 @@ const checkOut = async (req, res) => {
     if (log.rows[0].check_out_at) return res.status(409).json({ success: false, message: 'เช็คเอาท์วันนี้แล้ว' });
 
     const checkInAt = dayjs(log.rows[0].check_in_at);
-    const checkOutAt = dayjs();
+    const checkOutAt = nowLocal();
     const workHours = parseFloat((checkOutAt.diff(checkInAt, 'minute') / 60).toFixed(2));
     const otHours = workHours > 8 ? parseFloat((workHours - 8).toFixed(2)) : 0;
 
@@ -271,7 +282,7 @@ const checkOut = async (req, res) => {
 // second round-trip to /shift-configs.
 const getToday = async (req, res) => {
   try {
-    const today = dayjs().format('YYYY-MM-DD');
+    const today = nowLocal().format('YYYY-MM-DD');
     const empResult = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
     if (!empResult.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลพนักงาน' });
     const empId = empResult.rows[0].id;
@@ -311,7 +322,7 @@ const getToday = async (req, res) => {
 // GET /api/attendance/daily-summary?date=YYYY-MM-DD (HR/Owner only)
 const getDailySummary = async (req, res) => {
   try {
-    const date = req.query.date || dayjs().format('YYYY-MM-DD');
+    const date = req.query.date || nowLocal().format('YYYY-MM-DD');
 
     const [total, logs] = await Promise.all([
       query('SELECT COUNT(*) as count FROM employees WHERE is_active = true'),
@@ -366,7 +377,7 @@ const getDailySummary = async (req, res) => {
 const getRecentSummary = async (req, res) => {
   try {
     const days = Math.min(Math.max(parseInt(req.query.days, 10) || 5, 1), 31);
-    const end = dayjs();
+    const end = nowLocal();
 
     // Collect last N working days going backwards from today.
     const dates = [];
@@ -516,7 +527,7 @@ const getMyHistory = async (req, res) => {
          AND EXTRACT(MONTH FROM date) = $2
          AND EXTRACT(YEAR FROM date) = $3
        ORDER BY date DESC`,
-      [empResult.rows[0].id, month || dayjs().month() + 1, year || dayjs().year()]
+      [empResult.rows[0].id, month || nowLocal().month() + 1, year || nowLocal().year()]
     );
 
     const summary = {
