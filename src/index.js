@@ -879,6 +879,14 @@ if (process.env.NODE_ENV === 'development') app.use(morgan('dev'));
 
 app.use('/api/auth', authLimiter);
 app.use('/api', generalLimiter);
+// Hard no-store on every API response so the browser never serves a
+// stale GET out of its disk/memory cache after a mutating POST/PATCH.
+// (We were seeing /shifts revert to dayoff because /api/employees was
+// returning 304 to the refetch right after the bulk-save.)
+app.use('/api', (req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
 app.use('/api', routes);
 
 app.use((req, res) => {
