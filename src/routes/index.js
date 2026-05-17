@@ -5,6 +5,8 @@ const authCtrl = require('../controllers/authController');
 const attendCtrl = require('../controllers/attendanceController');
 const leaveCtrl = require('../controllers/leaveController');
 const { query, pool } = require('../../config/database');
+const { notify, notifyManyByRole, userIdFromEmployee } = require('../middleware/notify');
+const dayjsForNotif = require('dayjs');
 
 // ====== AUTH ======
 router.post('/auth/login', authCtrl.login);
@@ -73,6 +75,20 @@ router.post('/ot/request', authenticate, async (req, res) => {
       'INSERT INTO ot_requests (employee_id, date, start_time, end_time, hours, reason) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
       [empResult.rows[0].id, date, startTime, endTime, hours, reason]
     );
+
+    // Tell every approver about the new pending OT.
+    const nameRow = await query(
+      `SELECT CONCAT(first_name, ' ', last_name) AS n FROM employees WHERE id = $1`,
+      [empResult.rows[0].id]
+    );
+    notifyManyByRole(['hr', 'owner'], {
+      type: 'ot_request_pending',
+      title: `คำขอ OT ใหม่จาก ${nameRow.rows[0]?.n || 'พนักงาน'}`,
+      body: `${dayjsForNotif(date).format('D MMM')} · ${startTime}–${endTime} (${hours} ชม.)`,
+      link: '/ot',
+      relatedId: r.rows[0].id,
+    });
+
     res.status(201).json({ success: true, message: 'ยื่นขอ OT แล้ว', data: r.rows[0] });
   } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
 });
@@ -107,6 +123,26 @@ router.patch('/ot/:id/approve', authenticate, authorize('hr', 'owner'),
         req.params.id,
       ]
     );
+
+    // Notify the employee whose request just got decided. Need to look
+    // up the request meta because the SELECT above only fetched status.
+    const ot = await query(
+      `SELECT o.employee_id, o.date, o.start_time, o.end_time, o.hours
+         FROM ot_requests o WHERE o.id = $1`,
+      [req.params.id]
+    );
+    if (ot.rows[0]) {
+      const empUserId = await userIdFromEmployee(ot.rows[0].employee_id);
+      const bodyText = `${dayjsForNotif(ot.rows[0].date).format('D MMM')} · ${String(ot.rows[0].start_time).slice(0,5)}–${String(ot.rows[0].end_time).slice(0,5)} (${ot.rows[0].hours} ชม.)`;
+      notify(empUserId, {
+        type: action === 'approved' ? 'ot_approved' : 'ot_rejected',
+        title: action === 'approved' ? 'OT ของคุณได้รับการอนุมัติ' : 'OT ของคุณถูกปฏิเสธ',
+        body: rejectedReason ? `${bodyText} · "${rejectedReason}"` : bodyText,
+        link: '/ot',
+        relatedId: req.params.id,
+      });
+    }
+
     res.json({ success: true, message: action === 'approved' ? 'อนุมัติ OT แล้ว' : 'ปฏิเสธ OT แล้ว' });
   } catch (e) {
     console.error('PATCH /ot/:id/approve error:', e.message);
@@ -739,10 +775,26 @@ router.get('/announcements', authenticate, async (req, res) => {
 router.post('/announcements', authenticate, authorize('hr', 'owner'), async (req, res) => {
   try {
     const { title, content, type, targetRoles } = req.body;
+    const finalTargets = targetRoles && targetRoles.length > 0
+      ? targetRoles
+      : ['owner','hr','employee'];
     const r = await query(
       'INSERT INTO announcements (title, content, type, target_roles, created_by) VALUES ($1,$2,$3,$4,$5) RETURNING *',
-      [title, content, type || 'info', targetRoles || ['owner','hr','employee'], req.user.id]
+      [title, content, type || 'info', finalTargets, req.user.id]
     );
+
+    // Fan-out a bell notification to every active user in the target
+    // roles. The existing announcement_reads table tracks the "seen the
+    // full text" state — this notification is the prompt that takes
+    // them there.
+    notifyManyByRole(finalTargets, {
+      type: 'announcement',
+      title: `ประกาศใหม่: ${title}`,
+      body: content?.length > 80 ? content.slice(0, 80) + '…' : (content || null),
+      link: '/announcements',
+      relatedId: r.rows[0].id,
+    });
+
     res.status(201).json({ success: true, data: r.rows[0] });
   } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
 });
@@ -818,6 +870,105 @@ router.patch('/tasks/:id', authenticate, async (req, res) => {
     );
     res.json({ success: true, data: r.rows[0] });
   } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
+});
+
+// ====== NOTIFICATIONS ======
+// Every user gets their own personal bell. All endpoints are scoped to
+// req.user.id server-side — no way to read someone else's notifications.
+router.get('/notifications', authenticate, async (req, res) => {
+  const limit  = Math.min(parseInt(req.query.limit,  10) || 50, 200);
+  const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+  const unread = req.query.unread === 'true';
+  try {
+    const where = ['user_id = $1'];
+    const params = [req.user.id];
+    if (unread) where.push('read_at IS NULL');
+    params.push(limit); params.push(offset);
+    const r = await query(
+      `SELECT id, type, title, body, link, related_id, read_at, created_at
+         FROM notifications
+        WHERE ${where.join(' AND ')}
+        ORDER BY created_at DESC
+        LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+    const total = await query(
+      `SELECT COUNT(*)::int AS n FROM notifications WHERE ${where.join(' AND ')}`,
+      params.slice(0, params.length - 2)
+    );
+    res.json({ success: true, data: r.rows, meta: { total: total.rows[0]?.n || 0, limit, offset } });
+  } catch (e) {
+    console.error('GET /notifications error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// Lightweight badge endpoint — hit by the sidebar bell every ~30s, so
+// it must stay cheap. The partial index on (user_id) WHERE read_at IS
+// NULL keeps this O(rows-of-unread) regardless of total table size.
+router.get('/notifications/unread-count', authenticate, async (req, res) => {
+  try {
+    const r = await query(
+      `SELECT COUNT(*)::int AS n FROM notifications WHERE user_id = $1 AND read_at IS NULL`,
+      [req.user.id]
+    );
+    res.json({ success: true, data: { count: r.rows[0]?.n || 0 } });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.post('/notifications/:id/read', authenticate, async (req, res) => {
+  try {
+    await query(
+      `UPDATE notifications SET read_at = NOW()
+        WHERE id = $1 AND user_id = $2 AND read_at IS NULL`,
+      [req.params.id, req.user.id]
+    );
+    res.json({ success: true, message: 'อ่านแล้ว' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.post('/notifications/mark-all-read', authenticate, async (req, res) => {
+  try {
+    const r = await query(
+      `UPDATE notifications SET read_at = NOW()
+        WHERE user_id = $1 AND read_at IS NULL`,
+      [req.user.id]
+    );
+    res.json({ success: true, message: 'อ่านทั้งหมดแล้ว', data: { updated: r.rowCount } });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+router.delete('/notifications/:id', authenticate, async (req, res) => {
+  try {
+    await query(
+      `DELETE FROM notifications WHERE id = $1 AND user_id = $2`,
+      [req.params.id, req.user.id]
+    );
+    res.json({ success: true, message: 'ลบแล้ว' });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// Cleanup helper: drop everything the user has already read. Useful for
+// the "เคลียร์ที่อ่านแล้ว" button on /notifications. Doesn't touch
+// unread rows so HR can't accidentally lose pending tasks.
+router.post('/notifications/clear-read', authenticate, async (req, res) => {
+  try {
+    const r = await query(
+      `DELETE FROM notifications WHERE user_id = $1 AND read_at IS NOT NULL`,
+      [req.user.id]
+    );
+    res.json({ success: true, message: 'ลบรายการที่อ่านแล้ว', data: { deleted: r.rowCount } });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
 });
 
 // ====== AUDIT LOG ======
@@ -1151,6 +1302,17 @@ router.patch('/employees/:id/toggle-active', authenticate, authorize('owner'),
     const active = !e.rows[0].is_active
     await query('UPDATE employees SET is_active=$1 WHERE id=$2',[active,req.params.id])
     await query('UPDATE users SET is_active=$1 WHERE id=$2',[active,e.rows[0].user_id])
+
+    // Tell the affected user. When disabling they'll get this in the
+    // bell on their next login attempt (assuming they ever come back);
+    // when re-enabling it's reassuring confirmation.
+    notify(e.rows[0].user_id, {
+      type: active ? 'account_enabled' : 'account_disabled',
+      title: active ? 'บัญชีของคุณถูกเปิดใช้งานอีกครั้ง' : 'บัญชีของคุณถูกระงับ',
+      body: active ? null : 'หากต้องการสอบถาม กรุณาติดต่อ HR หรือเจ้าของบริษัท',
+      link: active ? '/dashboard' : null,
+    });
+
     res.json({success:true,message:active?'เปิดใช้งานแล้ว':'ระงับบัญชีแล้ว'})
   } catch(err){res.status(500).json({success:false,message:'เกิดข้อผิดพลาด'})}
 })
@@ -1167,6 +1329,16 @@ router.patch('/employees/:id/reset-password', authenticate, authorize('hr','owne
     if(!e.rows[0]) return res.status(404).json({success:false,message:'ไม่พบพนักงาน'})
     const hash = await bcrypt.hash(newPassword,12)
     await query('UPDATE users SET password_hash=$1,failed_login_count=0,locked_until=NULL WHERE id=$2',[hash,e.rows[0].user_id])
+
+    // Security-sensitive event — the employee should always know their
+    // password was changed externally so they can spot misuse.
+    notify(e.rows[0].user_id, {
+      type: 'password_reset',
+      title: 'รหัสผ่านของคุณถูกรีเซ็ต',
+      body: 'รหัสผ่านใหม่ถูกตั้งโดยผู้ดูแลระบบ หากไม่ใช่คุณกรุณาติดต่อ HR ทันที',
+      link: '/settings/change-password',
+    });
+
     res.json({success:true,message:'รีเซ็ตรหัสผ่านสำเร็จ'})
   } catch(err){res.status(500).json({success:false,message:'เกิดข้อผิดพลาด'})}
 })
@@ -1403,6 +1575,31 @@ router.delete('/payroll/:id', authenticate, authorize('hr', 'owner'), async (req
   }
 });
 
+// Tiny helper to look up payslip metadata once and notify the employee
+// — used by both approve and mark-paid which differ only in the title.
+async function notifyPayrollChange(payrollId, type, title) {
+  try {
+    const r = await query(
+      `SELECT employee_id, month, year, net_salary FROM payroll_records WHERE id = $1`,
+      [payrollId]
+    );
+    const row = r.rows[0];
+    if (!row) return;
+    const empUserId = await userIdFromEmployee(row.employee_id);
+    const monthName = ['', 'ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'][row.month] || '';
+    const net = Number(row.net_salary || 0).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    notify(empUserId, {
+      type,
+      title,
+      body: `เดือน ${monthName} ${row.year + 543} · สุทธิ ฿${net}`,
+      link: '/payroll',
+      relatedId: payrollId,
+    });
+  } catch (err) {
+    console.error(`[notify] payroll ${type} lookup failed:`, err.message);
+  }
+}
+
 // POST /payroll/:id/approve — flip status from draft → approved.
 router.post('/payroll/:id/approve', authenticate, authorize('hr', 'owner'),
   auditLog('payroll_approve', 'payroll_records'),
@@ -1414,6 +1611,7 @@ router.post('/payroll/:id/approve', authenticate, authorize('hr', 'owner'),
       [req.params.id]
     );
     if (!r.rows[0]) return res.status(400).json({ success: false, message: 'อนุมัติได้เฉพาะสลิปร่าง' });
+    notifyPayrollChange(r.rows[0].id, 'payroll_approved', 'สลิปเงินเดือนของคุณได้รับการอนุมัติ');
     res.json({ success: true, message: 'อนุมัติสลิปแล้ว', data: { id: r.rows[0].id } });
   } catch (err) {
     console.error('POST /payroll/:id/approve error:', err.message);
@@ -1432,6 +1630,7 @@ router.post('/payroll/:id/mark-paid', authenticate, authorize('hr', 'owner'),
       [req.params.id]
     );
     if (!r.rows[0]) return res.status(400).json({ success: false, message: 'จ่ายได้เฉพาะสลิปที่อนุมัติแล้ว' });
+    notifyPayrollChange(r.rows[0].id, 'payroll_paid', 'เงินเดือนของคุณจ่ายแล้ว');
     res.json({ success: true, message: 'ทำเครื่องหมายจ่ายแล้ว', data: { id: r.rows[0].id } });
   } catch (err) {
     console.error('POST /payroll/:id/mark-paid error:', err.message);

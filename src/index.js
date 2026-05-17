@@ -263,6 +263,35 @@ async function ensureSchema() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC)
     `);
+    // In-app notifications. One row per delivery (no fan-out by group);
+    // server-side helpers in middleware/notify.js fan out a single event
+    // to multiple recipients (e.g. notify all HR+owner when an employee
+    // files leave). type is an enum-like discriminator the frontend uses
+    // for icon/color; title/body are pre-rendered Thai strings; link is
+    // the in-app route to navigate to when the user clicks the row.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        type        VARCHAR(50) NOT NULL,
+        title       TEXT NOT NULL,
+        body        TEXT,
+        link        VARCHAR(200),
+        related_id  UUID,
+        read_at     TIMESTAMPTZ,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    // Partial index on the unread set — unread-count queries hit a tiny
+    // slice of the table even after notifications accumulate to millions.
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_notifications_user_unread
+        ON notifications(user_id) WHERE read_at IS NULL
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_notifications_user_created
+        ON notifications(user_id, created_at DESC)
+    `);
     // Selfie at check-in: base64 JPEG dataURL captured client-side. TEXT
     // because dataURLs run ~30-100KB after resize + JPEG compression, far
     // past any VARCHAR limit. Used by HR to verify the person who tapped

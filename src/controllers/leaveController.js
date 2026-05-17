@@ -1,5 +1,6 @@
 const { query } = require('../../config/database');
 const dayjs = require('dayjs');
+const { notify, notifyManyByRole, userIdFromEmployee } = require('../middleware/notify');
 
 // GET /api/leave/types
 const getLeaveTypes = async (req, res) => {
@@ -133,6 +134,25 @@ const createRequest = async (req, res) => {
       [empId, leaveTypeId, startDate, endDate, daysCount, reason]
     );
 
+    // Notify everyone who can approve. Lookup the leave_type name + the
+    // applicant's display name so the bell entry reads naturally.
+    const meta = await query(
+      `SELECT lt.name AS type_name,
+              CONCAT(e.first_name, ' ', e.last_name) AS emp_name
+         FROM leave_types lt, employees e
+        WHERE lt.id = $1 AND e.id = $2`,
+      [leaveTypeId, empId]
+    );
+    const typeName = meta.rows[0]?.type_name || 'การลา';
+    const empName  = meta.rows[0]?.emp_name  || 'พนักงาน';
+    notifyManyByRole(['hr', 'owner'], {
+      type: 'leave_request_pending',
+      title: `คำขอลาใหม่จาก ${empName}`,
+      body: `${typeName} ${dayjs(startDate).format('D MMM')}–${dayjs(endDate).format('D MMM')} (${daysCount} วัน)`,
+      link: '/leave',
+      relatedId: result.rows[0].id,
+    });
+
     res.status(201).json({
       success: true,
       message: 'ยื่นคำขอลาแล้ว รอ HR อนุมัติ',
@@ -207,6 +227,19 @@ const approveRequest = async (req, res) => {
         current = current.add(1, 'day');
       }
     }
+
+    // Notify the employee whose request was just decided.
+    const empUserId = await userIdFromEmployee(leave.employee_id);
+    const typeRow = await query('SELECT name FROM leave_types WHERE id = $1', [leave.leave_type_id]);
+    const typeName = typeRow.rows[0]?.name || 'การลา';
+    const rangeText = `${typeName} ${dayjs(leave.start_date).format('D MMM')}–${dayjs(leave.end_date).format('D MMM')} (${leave.days_count} วัน)`;
+    notify(empUserId, {
+      type: action === 'approved' ? 'leave_approved' : 'leave_rejected',
+      title: action === 'approved' ? 'คำขอลาของคุณได้รับการอนุมัติ' : 'คำขอลาของคุณถูกปฏิเสธ',
+      body: hrNotes ? `${rangeText} · "${hrNotes}"` : rangeText,
+      link: '/leave',
+      relatedId: id,
+    });
 
     res.json({
       success: true,
