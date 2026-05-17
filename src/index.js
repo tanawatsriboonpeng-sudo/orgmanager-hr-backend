@@ -494,6 +494,24 @@ async function ensureSchema() {
     await client.query(`
       INSERT INTO org_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING
     `);
+    // Holidays table — was migrate.js-only, but a freshly-rebuilt prod
+    // DB that skipped migrate.js wouldn't have it, and every HR feature
+    // that respects "is this a working day?" depends on it. Schema
+    // matches migrate.js exactly so re-running this on an existing
+    // table is a no-op.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS holidays (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(200) NOT NULL,
+        date DATE NOT NULL,
+        type VARCHAR(20) DEFAULT 'national' CHECK (type IN ('national','company','compensatory')),
+        year INT NOT NULL,
+        created_by UUID REFERENCES users(id),
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(date)
+      )
+    `);
+
     // Calendar events — owner/HR-managed meetings, seminars, company
     // milestones. Distinct from `holidays` (which is the public/company
     // day-off list, already used by leave + attendance) so HR can

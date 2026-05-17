@@ -867,26 +867,60 @@ router.get('/holidays', authenticate, async (req, res) => {
     const year = req.query.year || new Date().getFullYear();
     const result = await query('SELECT * FROM holidays WHERE year = $1 ORDER BY date', [year]);
     res.json({ success: true, data: result.rows });
-  } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
+  } catch (e) {
+    console.error('GET /holidays error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
 });
 
 router.post('/holidays', authenticate, authorize('hr', 'owner'), async (req, res) => {
   try {
     const { name, date, type } = req.body;
-    const year = new Date(date).getFullYear();
+    // Input guards added because the previous silent-catch buried the
+    // real error class — missing/bad date used to fall through to a
+    // generic 500 with no log line, which is what was confusing the
+    // user's first "เพิ่ม" attempt.
+    if (typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ success: false, message: 'กรุณาระบุชื่อวันหยุด' });
+    }
+    if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return res.status(400).json({ success: false, message: 'รูปแบบวันที่ไม่ถูกต้อง (ต้องเป็น YYYY-MM-DD)' });
+    }
+    const parsedYear = parseInt(date.slice(0, 4), 10);
+    if (!Number.isFinite(parsedYear) || parsedYear < 1900 || parsedYear > 2200) {
+      return res.status(400).json({ success: false, message: 'ปีไม่ถูกต้อง' });
+    }
+    // Type defaults to 'national'. The schema's CHECK constraint only
+    // allows 'national' | 'company' | 'compensatory' — `religious` will
+    // be rejected by Postgres with a CHECK violation, so we normalize
+    // anything outside the allowed set to 'national' rather than 500ing.
+    const allowed = new Set(['national', 'company', 'compensatory']);
+    const safeType = allowed.has(type) ? type : 'national';
     const r = await query(
-      'INSERT INTO holidays (name, date, type, year, created_by) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (date) DO NOTHING RETURNING *',
-      [name, date, type || 'national', year, req.user.id]
+      `INSERT INTO holidays (name, date, type, year, created_by)
+       VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (date) DO NOTHING RETURNING *`,
+      [name.trim(), date, safeType, parsedYear, req.user.id]
     );
+    if (!r.rows[0]) {
+      // ON CONFLICT DO NOTHING returned no row — date already exists.
+      return res.status(409).json({ success: false, message: 'วันที่นี้มีวันหยุดอยู่แล้ว' });
+    }
     res.status(201).json({ success: true, data: r.rows[0] });
-  } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
+  } catch (e) {
+    console.error('POST /holidays error:', e.code, e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
 });
 
 router.delete('/holidays/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
   try {
     await query('DELETE FROM holidays WHERE id = $1', [req.params.id]);
     res.json({ success: true, message: 'ลบวันหยุดแล้ว' });
-  } catch (e) { res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' }); }
+  } catch (e) {
+    console.error('DELETE /holidays/:id error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
 });
 
 // ====== CALENDAR EVENTS ======
