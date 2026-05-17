@@ -167,10 +167,14 @@ const checkIn = async (req, res) => {
     const now = nowLocal();
     const today = now.format('YYYY-MM-DD');
 
-    // Selfie size guard. ~500KB cap is enough for a 480px JPEG at ~0.7
-    // quality and keeps the Postgres row well under TOAST thresholds.
-    if (selfie && typeof selfie === 'string' && selfie.length > 700 * 1024) {
-      return res.status(413).json({ success: false, message: 'รูปเซลฟี่ใหญ่เกินไป (สูงสุด ~500KB)' });
+    // Selfie size guard. Frontend webcam path produces ~50-100KB at
+    // 480px JPEG 0.7, but iPhone Pro HDR photos uploaded from the
+    // gallery can be 800KB+. ~1.5MB binary (2MB base64) keeps the row
+    // small enough not to hurt query speed while not nagging legit
+    // uploads. Same cap is mirrored in the leave-doc + backdate
+    // attachment guards.
+    if (selfie && typeof selfie === 'string' && selfie.length > 2 * 1024 * 1024) {
+      return res.status(413).json({ success: false, message: 'รูปเซลฟี่ใหญ่เกินไป (สูงสุด ~1.5MB)' });
     }
 
     // Off-site path: HR/owner approves later; we skip the GPS radius
@@ -727,9 +731,9 @@ const createBackdateRequest = async (req, res) => {
   if (!date || !requestType || !reason || !String(reason).trim()) {
     return res.status(400).json({ success: false, message: 'กรุณาระบุวันที่ ประเภท และเหตุผล' });
   }
-  // Optional attachment cap — same ~500KB rule as the selfie field.
-  if (attachment && typeof attachment === 'string' && attachment.length > 700 * 1024) {
-    return res.status(413).json({ success: false, message: 'รูปหลักฐานใหญ่เกินไป (สูงสุด ~500KB)' });
+  // Optional attachment cap — same ~1.5MB rule as the selfie field.
+  if (attachment && typeof attachment === 'string' && attachment.length > 2 * 1024 * 1024) {
+    return res.status(413).json({ success: false, message: 'รูปหลักฐานใหญ่เกินไป (สูงสุด ~1.5MB)' });
   }
   if (!['check_in', 'check_out', 'both'].includes(requestType)) {
     return res.status(400).json({ success: false, message: 'ประเภทคำขอไม่ถูกต้อง' });

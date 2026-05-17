@@ -89,10 +89,11 @@ const getAllQuotas = async (req, res) => {
   }
 };
 
-// Cap the inline base64 size we accept for any leave document. ~500KB
-// after base64 overhead matches the avatar/logo limit we use elsewhere
-// and is plenty for a phone photo of a medical certificate.
-const MAX_DOCUMENT_BYTES = 700 * 1024;
+// Cap the inline base64 size we accept for any leave document. ~1.5MB
+// binary (2MB base64) covers phone photos of medical certificates even
+// without aggressive client-side compression. Same cap as the
+// attendance selfie / backdate attachment paths.
+const MAX_DOCUMENT_BYTES = 2 * 1024 * 1024;
 
 // Walk the date range and count working days (Mon–Fri). Pulled out of
 // createRequest so adminCreateLeave can reuse it without duplicating the
@@ -122,7 +123,7 @@ const createRequest = async (req, res) => {
       return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลให้ครบ' });
     }
     if (document && typeof document === 'string' && document.length > MAX_DOCUMENT_BYTES) {
-      return res.status(413).json({ success: false, message: 'ไฟล์แนบใหญ่เกินไป (สูงสุด ~500KB)' });
+      return res.status(413).json({ success: false, message: 'ไฟล์แนบใหญ่เกินไป (สูงสุด ~1.5MB)' });
     }
 
     const empResult = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
@@ -649,7 +650,7 @@ const adminCreateLeave = async (req, res) => {
     return res.status(400).json({ success: false, message: 'กรุณากรอกข้อมูลให้ครบ' });
   }
   if (document && typeof document === 'string' && document.length > MAX_DOCUMENT_BYTES) {
-    return res.status(413).json({ success: false, message: 'ไฟล์แนบใหญ่เกินไป (สูงสุด ~500KB)' });
+    return res.status(413).json({ success: false, message: 'ไฟล์แนบใหญ่เกินไป (สูงสุด ~1.5MB)' });
   }
   const start = dayjs(startDate);
   const end = dayjs(endDate);

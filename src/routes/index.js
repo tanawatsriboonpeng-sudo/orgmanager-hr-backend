@@ -34,8 +34,18 @@ const blockOwner = (req, res, next) => {
   }
   next();
 };
-router.post('/attendance/check-in', authenticate, blockOwner, attendCtrl.checkIn);
-router.post('/attendance/check-out', authenticate, blockOwner, attendCtrl.checkOut);
+// Audit-log every check-in/out so the IP/UA + timestamp are preserved
+// alongside the attendance_logs row. attendance_logs is the data
+// record; audit_logs answers "from where + via what device". Volume is
+// manageable — ~2 rows/employee/day, retention prunes after 730 days.
+router.post('/attendance/check-in',
+  authenticate, blockOwner,
+  auditLog('attendance_check_in', 'attendance_logs'),
+  attendCtrl.checkIn);
+router.post('/attendance/check-out',
+  authenticate, blockOwner,
+  auditLog('attendance_check_out', 'attendance_logs'),
+  attendCtrl.checkOut);
 router.get('/attendance/today', authenticate, attendCtrl.getToday);
 router.get('/attendance/my-history', authenticate, attendCtrl.getMyHistory);
 router.get('/attendance/daily-summary', authenticate, authorize('owner', 'hr'), attendCtrl.getDailySummary);
@@ -1138,7 +1148,21 @@ router.post('/employees/create', authenticate, authorize('hr','owner'),
       finalPosition = pRes.rows[0].name
     }
     const uRes = await query('INSERT INTO users(employee_id,email,password_hash,role) VALUES($1,$2,$3,$4) RETURNING id',[employeeId,email.toLowerCase(),hash,role||'employee'])
-    await query('INSERT INTO employees(user_id,employee_id,first_name,last_name,department_id,position,position_id,shift_type,base_salary,start_date) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,CURRENT_DATE)',[uRes.rows[0].id,employeeId,firstName,lastName,deptId,finalPosition,finalPositionId,shiftType||'normal',baseSalary||0])
+    const empRes = await query('INSERT INTO employees(user_id,employee_id,first_name,last_name,department_id,position,position_id,shift_type,base_salary,start_date) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,CURRENT_DATE) RETURNING id',[uRes.rows[0].id,employeeId,firstName,lastName,deptId,finalPosition,finalPositionId,shiftType||'normal',baseSalary||0])
+    // Auto-seed leave quotas for the new hire's current calendar year so
+    // they show up on /leave's team-quota table immediately — without
+    // this HR has to remember to seed manually every time. Skip the
+    // owner role (owner has no quota row anywhere else in the system).
+    if ((role || 'employee') !== 'owner') {
+      await query(
+        `INSERT INTO leave_quotas (employee_id, leave_type_id, year, total_days, used_days)
+         SELECT $1, lt.id, EXTRACT(YEAR FROM CURRENT_DATE)::int, lt.days_per_year, 0
+           FROM leave_types lt
+          WHERE lt.is_active = true AND lt.days_per_year > 0
+         ON CONFLICT (employee_id, leave_type_id, year) DO NOTHING`,
+        [empRes.rows[0].id]
+      ).catch(err => console.error('[leave] auto-seed quotas for new employee failed:', err.message))
+    }
     res.status(201).json({success:true,message:`สร้างบัญชี ${firstName} ${lastName} สำเร็จ`})
   } catch(err) {
     if(err.code==='23505') return res.status(400).json({success:false,message:'อีเมลหรือรหัสพนักงานซ้ำในระบบ'})
