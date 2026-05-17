@@ -2888,6 +2888,22 @@ router.post('/cleaning/items', authenticate, authorize('hr', 'owner'),
        VALUES ($1, $2, $3) RETURNING *`,
       [String(name).trim(), description || null, Number.isFinite(+displayOrder) ? +displayOrder : 0]
     );
+    // Sync to today's open/rejected session — HR adding a row mid-day
+    // should appear in the inspector's checklist immediately. We only
+    // touch sessions that haven't been finalized, and skip if the row
+    // is already present (idempotent for duplicate clicks).
+    await query(
+      `INSERT INTO cleaning_session_items (session_id, item_id, item_name, display_order)
+       SELECT s.id, $1, $2, $3
+         FROM cleaning_sessions s
+        WHERE s.session_date = $4
+          AND s.status IN ('open', 'rejected')
+          AND NOT EXISTS (
+            SELECT 1 FROM cleaning_session_items i
+             WHERE i.session_id = s.id AND i.item_id = $1
+          )`,
+      [r.rows[0].id, r.rows[0].name, r.rows[0].display_order, bangkokDateISO()]
+    );
     res.status(201).json({ success: true, data: r.rows[0] });
   } catch (e) {
     console.error('POST /cleaning/items error:', e.message);
@@ -2900,18 +2916,68 @@ router.patch('/cleaning/items/:id', authenticate, authorize('hr', 'owner'),
   async (req, res) => {
   const { name, description, displayOrder, isActive } = req.body;
   try {
-    await query(
+    const up = await query(
       `UPDATE cleaning_items SET
          name          = COALESCE($1, name),
          description   = COALESCE($2, description),
          display_order = COALESCE($3, display_order),
          is_active     = COALESCE($4, is_active),
          updated_at    = NOW()
-       WHERE id = $5`,
+       WHERE id = $5
+       RETURNING *`,
       [name ?? null, description ?? null,
        displayOrder ?? null, typeof isActive === 'boolean' ? isActive : null,
        req.params.id]
     );
+    const row = up.rows[0];
+    // Mirror the edit into today's still-editable session so the
+    // inspector sees the latest text/order. Only touch rows that
+    // haven't been filled — preserve any work the inspector has done.
+    if (row) {
+      const today = bangkokDateISO();
+      if (row.is_active) {
+        await query(
+          `UPDATE cleaning_session_items i
+              SET item_name = $1, display_order = $2
+             FROM cleaning_sessions s
+            WHERE i.session_id = s.id
+              AND i.item_id = $3
+              AND s.session_date = $4
+              AND s.status IN ('open', 'rejected')
+              AND i.done_by_employee_id IS NULL
+              AND COALESCE(i.not_done, false) = false`,
+          [row.name, row.display_order, row.id, today]
+        );
+        // If a previously-deactivated item just came back on, re-insert
+        // it into today's open session (skipped above by item_id match
+        // because no row exists yet).
+        await query(
+          `INSERT INTO cleaning_session_items (session_id, item_id, item_name, display_order)
+           SELECT s.id, $1, $2, $3
+             FROM cleaning_sessions s
+            WHERE s.session_date = $4
+              AND s.status IN ('open', 'rejected')
+              AND NOT EXISTS (
+                SELECT 1 FROM cleaning_session_items i
+                 WHERE i.session_id = s.id AND i.item_id = $1
+              )`,
+          [row.id, row.name, row.display_order, today]
+        );
+      } else {
+        // Deactivated → pull from today's checklist (only if untouched).
+        await query(
+          `DELETE FROM cleaning_session_items i
+            USING cleaning_sessions s
+            WHERE i.session_id = s.id
+              AND i.item_id = $1
+              AND s.session_date = $2
+              AND s.status IN ('open', 'rejected')
+              AND i.done_by_employee_id IS NULL
+              AND COALESCE(i.not_done, false) = false`,
+          [row.id, today]
+        );
+      }
+    }
     res.json({ success: true, message: 'อัปเดตแล้ว' });
   } catch (e) {
     console.error('PATCH /cleaning/items/:id error:', e.message);
@@ -2923,6 +2989,20 @@ router.delete('/cleaning/items/:id', authenticate, authorize('hr', 'owner'),
   auditLog('cleaning_item_delete', 'cleaning_items'),
   async (req, res) => {
   try {
+    // Pull from today's still-editable session BEFORE master delete so
+    // the SET NULL FK doesn't leave a ghost row in today's checklist.
+    // Past-day sessions keep their snapshot (item_name preserved).
+    await query(
+      `DELETE FROM cleaning_session_items i
+        USING cleaning_sessions s
+        WHERE i.session_id = s.id
+          AND i.item_id = $1
+          AND s.session_date = $2
+          AND s.status IN ('open', 'rejected')
+          AND i.done_by_employee_id IS NULL
+          AND COALESCE(i.not_done, false) = false`,
+      [req.params.id, bangkokDateISO()]
+    );
     await query('DELETE FROM cleaning_items WHERE id = $1', [req.params.id]);
     res.json({ success: true, message: 'ลบแล้ว' });
   } catch (e) {
@@ -3262,6 +3342,90 @@ router.patch('/cleaning/sessions/:id/inspector', authenticate, authorize('hr', '
     res.json({ success: true, message: 'เปลี่ยนผู้ตรวจแล้ว' });
   } catch (e) {
     console.error('PATCH /cleaning/sessions/:id/inspector error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// Inspector adds an ad-hoc item to their own session — for jobs that
+// weren't on the master list but actually got done today. Stored with
+// item_id=NULL so it never re-syncs from master edits. Only the
+// assigned inspector, only while the session is still editable.
+router.post('/cleaning/sessions/:id/items', authenticate,
+  auditLog('cleaning_session_item_add', 'cleaning_session_items'),
+  async (req, res) => {
+  const { name } = req.body;
+  if (!name || !String(name).trim()) {
+    return res.status(400).json({ success: false, message: 'กรุณาระบุชื่องาน' });
+  }
+  try {
+    const s = await query('SELECT * FROM cleaning_sessions WHERE id = $1', [req.params.id]);
+    if (!s.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบรอบ' });
+    const session = s.rows[0];
+    if (!['open', 'rejected', 'inspector_reviewed'].includes(session.status)) {
+      return res.status(400).json({ success: false, message: 'สถานะรอบไม่อนุญาตให้แก้ไข' });
+    }
+    const me = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
+    const myEmpId = me.rows[0]?.id;
+    if (!myEmpId || myEmpId !== session.inspector_id) {
+      return res.status(403).json({ success: false, message: 'เฉพาะผู้ตรวจของรอบนี้เท่านั้น' });
+    }
+    // Place ad-hoc items at the end of the list.
+    const maxR = await query(
+      'SELECT COALESCE(MAX(display_order), 0) AS m FROM cleaning_session_items WHERE session_id = $1',
+      [req.params.id]
+    );
+    const nextOrder = (maxR.rows[0]?.m || 0) + 10;
+    const ins = await query(
+      `INSERT INTO cleaning_session_items
+         (session_id, item_id, item_name, display_order)
+       VALUES ($1, NULL, $2, $3)
+       RETURNING *`,
+      [req.params.id, String(name).trim().slice(0, 200), nextOrder]
+    );
+    res.status(201).json({ success: true, data: ins.rows[0] });
+  } catch (e) {
+    console.error('POST /cleaning/sessions/:id/items error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
+// Inspector removes an ad-hoc item they added — only their own ad-hoc
+// rows (item_id IS NULL) and only while the row is untouched. Cannot
+// delete master items via this endpoint (HR must do that from settings).
+router.delete('/cleaning/sessions/:id/items/:itemId', authenticate,
+  auditLog('cleaning_session_item_delete', 'cleaning_session_items'),
+  async (req, res) => {
+  try {
+    const s = await query('SELECT * FROM cleaning_sessions WHERE id = $1', [req.params.id]);
+    if (!s.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบรอบ' });
+    const session = s.rows[0];
+    if (!['open', 'rejected', 'inspector_reviewed'].includes(session.status)) {
+      return res.status(400).json({ success: false, message: 'สถานะรอบไม่อนุญาตให้แก้ไข' });
+    }
+    const me = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
+    const myEmpId = me.rows[0]?.id;
+    if (!myEmpId || myEmpId !== session.inspector_id) {
+      return res.status(403).json({ success: false, message: 'เฉพาะผู้ตรวจของรอบนี้เท่านั้น' });
+    }
+    const del = await query(
+      `DELETE FROM cleaning_session_items
+        WHERE id = $1
+          AND session_id = $2
+          AND item_id IS NULL
+          AND done_by_employee_id IS NULL
+          AND COALESCE(not_done, false) = false
+        RETURNING id`,
+      [req.params.itemId, req.params.id]
+    );
+    if (del.rowCount === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'ลบได้เฉพาะรายการที่เพิ่มเองและยังไม่ได้กรอกข้อมูล',
+      });
+    }
+    res.json({ success: true, message: 'ลบแล้ว' });
+  } catch (e) {
+    console.error('DELETE /cleaning/sessions/:id/items/:itemId error:', e.message);
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
 });
