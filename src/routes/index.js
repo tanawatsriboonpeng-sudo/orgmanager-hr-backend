@@ -58,10 +58,32 @@ router.post('/attendance/admin-record', authenticate, authorize('owner', 'hr'), 
 
 // ====== LEAVE ======
 router.get('/leave/types', authenticate, leaveCtrl.getLeaveTypes);
+router.get('/leave/types-all', authenticate, authorize('hr', 'owner'), leaveCtrl.getAllLeaveTypes);
+router.post('/leave/types',
+  authenticate, authorize('hr', 'owner'),
+  auditLog('leave_type_create', 'leave_types'),
+  leaveCtrl.createLeaveType);
+router.patch('/leave/types/:id',
+  authenticate, authorize('hr', 'owner'),
+  auditLog('leave_type_update', 'leave_types'),
+  leaveCtrl.updateLeaveType);
+router.delete('/leave/types/:id',
+  authenticate, authorize('hr', 'owner'),
+  auditLog('leave_type_delete', 'leave_types'),
+  leaveCtrl.deleteLeaveType);
 router.get('/leave/my-quota', authenticate, leaveCtrl.getMyQuota);
 router.get('/leave/all-quotas', authenticate, authorize('hr', 'owner'), leaveCtrl.getAllQuotas);
+router.put('/leave/quotas',
+  authenticate, authorize('hr', 'owner'),
+  auditLog('leave_quota_set', 'leave_quotas'),
+  leaveCtrl.setQuota);
 router.get('/leave/my-history', authenticate, leaveCtrl.getMyHistory);
+router.get('/leave/all-requests', authenticate, authorize('hr', 'owner'), leaveCtrl.getAllRequests);
 router.post('/leave/request', authenticate, leaveCtrl.createRequest);
+router.post('/leave/admin-record',
+  authenticate, authorize('hr', 'owner'),
+  auditLog('leave_admin_record', 'leave_requests'),
+  leaveCtrl.adminCreateLeave);
 router.post('/leave/:id/cancel', authenticate, leaveCtrl.cancelRequest);
 router.get('/leave/pending', authenticate, authorize('hr', 'owner'), leaveCtrl.getPending);
 // Owner included for the single-owner-no-HR case; if the company has HR

@@ -43,6 +43,7 @@ async function purgeOnce() {
     selfies_cleared: 0,
     offsite_selfies_cleared: 0,
     backdate_attachments_cleared: 0,
+    leave_documents_cleared: 0,
     notifications_deleted: 0,
     audit_logs_deleted: 0,
     expired_refresh_tokens_deleted: 0,
@@ -104,6 +105,26 @@ async function purgeOnce() {
       [policy.retention_attachment_days]
     );
     summary.backdate_attachments_cleared = r.rowCount || 0;
+  }
+
+  // 3b) Leave request documents (medical certificates etc.) — same
+  //     window as backdate attachments since they're functionally the
+  //     same kind of evidence. The leave row + decision metadata stays.
+  {
+    const colCheck = await query(
+      `SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'leave_requests' AND column_name = 'document'`
+    );
+    if (colCheck.rows[0]) {
+      const r = await query(
+        `UPDATE leave_requests
+            SET document = NULL
+          WHERE document IS NOT NULL
+            AND created_at < NOW() - ($1::int || ' days')::interval`,
+        [policy.retention_attachment_days]
+      );
+      summary.leave_documents_cleared = r.rowCount || 0;
+    }
   }
 
   // 4) Notifications — delete fully. Old "you have a leave request"

@@ -496,6 +496,28 @@ async function ensureSchema() {
       ADD COLUMN IF NOT EXISTS last_purge_at               TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS last_purge_summary          JSONB
     `);
+    // Leave request evidence/document. migrate.js made it a VARCHAR(500)
+    // for hypothetical URLs, but we store base64 dataURLs inline (same
+    // pattern as attendance selfies + backdate attachments) so the
+    // column needs to be TEXT. ALTER … TYPE TEXT is safe and idempotent:
+    // running on an already-TEXT column is a no-op. We also gate on the
+    // column existing in case a legacy DB doesn't have it yet.
+    await client.query(`
+      DO $$ BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+           WHERE table_name = 'leave_requests' AND column_name = 'document_url'
+        ) THEN
+          ALTER TABLE leave_requests ALTER COLUMN document_url TYPE TEXT;
+        END IF;
+      END $$;
+    `);
+    // Keep a generic 'document' column as the canonical name going
+    // forward; document_url stays around for back-compat reads.
+    await client.query(`
+      ALTER TABLE leave_requests
+      ADD COLUMN IF NOT EXISTS document TEXT
+    `);
     // KPI tables — defensive in case prod DB predates migrate.js.
     // criteria: weighted rubric items. weight is a relative number (no need
     // to sum to 100); the review-overall formula divides by the sum of the
