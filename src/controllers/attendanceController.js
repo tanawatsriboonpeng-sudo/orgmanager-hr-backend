@@ -1,6 +1,7 @@
 const { query } = require('../../config/database');
 const geolib = require('geolib');
 const dayjs = require('dayjs');
+const { notify, notifyManyByRole, userIdFromEmployee } = require('../middleware/notify');
 // Render runs in UTC by default, so a bare dayjs() returns the wrong
 // hour-of-day for status calculation (the user's 10:18 reads as 03:18
 // at the server and gets bucketed as "ตรงเวลา"). Anchor everything
@@ -215,6 +216,28 @@ const checkIn = async (req, res) => {
        status, detail, selfie || null, !!almostLate,
        offsiteFlag, offsiteFlag ? String(reason).trim() : null, offsiteStatus]
     );
+
+    // Off-site submission is the trigger that HR/owner need a heads-up
+    // for; a normal in-radius check-in is self-service and doesn't need
+    // to wake anyone up. We look up the employee's display name so the
+    // bell entry reads naturally instead of "พนักงาน".
+    if (offsiteFlag) {
+      const nameRow = await query(
+        `SELECT CONCAT(first_name, ' ', last_name) AS n FROM employees WHERE id = $1`,
+        [emp.id]
+      ).catch(() => ({ rows: [] }));
+      const empName = nameRow.rows[0]?.n || 'พนักงาน';
+      const distanceTxt = distanceM != null
+        ? `ห่างออฟฟิศ ${(distanceM / 1000).toFixed(1)} กม.`
+        : 'ไม่ระบุระยะ';
+      notifyManyByRole(['hr', 'owner'], {
+        type: 'attendance_offsite_pending',
+        title: `คำขอลงเวลานอกสถานที่จาก ${empName}`,
+        body: `${now.format('HH:mm')} · ${distanceTxt} · เหตุผล: ${String(reason).trim().slice(0, 80)}`,
+        link: '/attendance',
+        relatedId: result.rows[0].id,
+      });
+    }
 
     res.json({
       success: true,
@@ -480,12 +503,22 @@ const approveOffsite = async (req, res) => {
         WHERE id = $2
           AND is_offsite = true
           AND offsite_status = 'pending'
-        RETURNING id`,
+        RETURNING id, employee_id, date, check_in_at`,
       [req.user.id, req.params.id]
     );
     if (!r.rows[0]) {
       return res.status(400).json({ success: false, message: 'อนุมัติได้เฉพาะคำขอที่รออนุมัติ' });
     }
+    // Notify the employee that their request landed.
+    const row = r.rows[0];
+    const empUserId = await userIdFromEmployee(row.employee_id);
+    notify(empUserId, {
+      type: 'attendance_offsite_approved',
+      title: 'อนุมัติการลงเวลานอกสถานที่ของคุณแล้ว',
+      body: `วันที่ ${dayjs(row.date).format('D MMM')} · เช็คอินเวลา ${dayjs(row.check_in_at).format('HH:mm')}`,
+      link: '/attendance',
+      relatedId: row.id,
+    });
     res.json({ success: true, message: 'อนุมัติการลงเวลานอกสถานที่แล้ว' });
   } catch (err) {
     console.error('POST /attendance/offsite/:id/approve error:', err.message);
@@ -500,6 +533,7 @@ const approveOffsite = async (req, res) => {
 const rejectOffsite = async (req, res) => {
   try {
     const { reason } = req.body;
+    const cleanReason = reason ? String(reason).trim() : null;
     const r = await query(
       `UPDATE attendance_logs
           SET offsite_status        = 'rejected',
@@ -510,12 +544,25 @@ const rejectOffsite = async (req, res) => {
         WHERE id = $3
           AND is_offsite = true
           AND offsite_status = 'pending'
-        RETURNING id`,
-      [req.user.id, reason ? String(reason).trim() : null, req.params.id]
+        RETURNING id, employee_id, date, check_in_at`,
+      [req.user.id, cleanReason, req.params.id]
     );
     if (!r.rows[0]) {
       return res.status(400).json({ success: false, message: 'ปฏิเสธได้เฉพาะคำขอที่รออนุมัติ' });
     }
+    // Notify the employee with the reason inline (so they see *why*
+    // without having to open the page).
+    const row = r.rows[0];
+    const empUserId = await userIdFromEmployee(row.employee_id);
+    const bodyParts = [`วันที่ ${dayjs(row.date).format('D MMM')} · เช็คอินเวลา ${dayjs(row.check_in_at).format('HH:mm')}`];
+    if (cleanReason) bodyParts.push(`หมายเหตุ: ${cleanReason}`);
+    notify(empUserId, {
+      type: 'attendance_offsite_rejected',
+      title: 'ไม่อนุมัติการลงเวลานอกสถานที่ของคุณ',
+      body: bodyParts.join(' · '),
+      link: '/attendance',
+      relatedId: row.id,
+    });
     res.json({ success: true, message: 'ปฏิเสธการลงเวลานอกสถานที่แล้ว' });
   } catch (err) {
     console.error('POST /attendance/offsite/:id/reject error:', err.message);
