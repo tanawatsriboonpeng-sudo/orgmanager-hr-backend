@@ -27,18 +27,17 @@ const getMyQuota = async (req, res) => {
       [empResult.rows[0].id, year]
     );
 
-    // ถ้ายังไม่มี quota สร้างจาก leave_types default
+    // ถ้ายังไม่มี quota สร้างจาก leave_types default — รวม 0-day types
+    // ด้วย เพื่อให้พนักงานเห็น category ครบและ HR ตั้ง quota รายคนได้
     if (result.rows.length === 0) {
       const types = await query('SELECT * FROM leave_types WHERE is_active = true');
       const quotaRows = [];
       for (const lt of types.rows) {
-        if (lt.days_per_year > 0) {
-          const r = await query(
-            'INSERT INTO leave_quotas (employee_id, leave_type_id, year, total_days) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING RETURNING *',
-            [empResult.rows[0].id, lt.id, year, lt.days_per_year]
-          );
-          if (r.rows[0]) quotaRows.push({ ...r.rows[0], leave_type_name: lt.name, code: lt.code });
-        }
+        const r = await query(
+          'INSERT INTO leave_quotas (employee_id, leave_type_id, year, total_days) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING RETURNING *',
+          [empResult.rows[0].id, lt.id, year, lt.days_per_year || 0]
+        );
+        if (r.rows[0]) quotaRows.push({ ...r.rows[0], leave_type_name: lt.name, code: lt.code });
       }
       return res.json({ success: true, data: quotaRows });
     }
