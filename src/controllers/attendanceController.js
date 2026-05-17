@@ -440,11 +440,12 @@ const getDailySummary = async (req, res) => {
     //      in) so the small-company dashboard can render a named-list
     //      view of everyone with their status today.
     const dowKey = String(dayjs(date).day());
-    const [roster, logs, holidays] = await Promise.all([
+    const [roster, logs, holidays, shifts] = await Promise.all([
       query(
         `SELECT e.id, e.first_name, e.last_name, e.nickname, e.avatar_url,
                 e.employee_id AS emp_code, e.position, e.shift_type,
                 e.weekly_shifts,
+                u.role AS user_role,
                 d.name AS department_name
            FROM employees e
            JOIN users u ON e.user_id = u.id
@@ -470,6 +471,14 @@ const getDailySummary = async (req, res) => {
       query(
         `SELECT id, name, type FROM holidays WHERE date = $1`,
         [date]
+      ).catch(() => ({ rows: [] })),
+      // Active shift configs so the dashboard can render each person's
+      // "กะเริ่ม HH:MM" hint without a second round-trip. Cheap — ~3-5
+      // rows tops in a typical install.
+      query(
+        `SELECT code, shift_type, work_start, work_end
+           FROM shift_configs
+          WHERE is_active = true`
       ).catch(() => ({ rows: [] })),
     ]);
 
@@ -540,6 +549,11 @@ const getDailySummary = async (req, res) => {
         roster: rosterTagged,
         records: counted,
         rejectedRecords: rejected,
+        // Active shift configs keyed by code for the per-person "กะเริ่ม"
+        // hint in the dashboard's roster. Frontend looks up the employee's
+        // weekly_shifts[dow] code, falls back to first active config of
+        // their shift_type, then a hardcoded 09:00.
+        shifts: shifts.rows,
       }
     });
   } catch (err) {
