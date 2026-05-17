@@ -339,14 +339,19 @@ const getDailySummary = async (req, res) => {
     ]);
 
     const totalEmp = parseInt(total.rows[0].count);
-    // Note: present is the total green-bucket count (includes almost_late
-    // rows). almostLate is broken out as its own number so the UI can show
-    // it as a separate 5th bucket without double-counting.
-    const present    = logs.rows.filter(r => r.status === 'present').length;
-    const almostLate = logs.rows.filter(r => r.status === 'present' && r.almost_late).length;
-    const late       = logs.rows.filter(r => r.status === 'late').length;
-    const absent     = logs.rows.filter(r => r.status === 'absent').length;
-    const onLeave    = logs.rows.filter(r => r.status === 'leave').length;
+    // A rejected off-site check-in is treated as if the employee never
+    // checked in — they go back into the "ยังไม่เข้า" bucket and don't
+    // count toward present/late/etc. The original row is still here so
+    // it can be surfaced as a separate "ปฏิเสธ" group for HR awareness.
+    const isRejectedOffsite = r => r.is_offsite && r.offsite_status === 'rejected';
+    const counted  = logs.rows.filter(r => !isRejectedOffsite(r));
+    const rejected = logs.rows.filter(isRejectedOffsite);
+
+    const present    = counted.filter(r => r.status === 'present').length;
+    const almostLate = counted.filter(r => r.status === 'present' && r.almost_late).length;
+    const late       = counted.filter(r => r.status === 'late').length;
+    const absent     = counted.filter(r => r.status === 'absent').length;
+    const onLeave    = counted.filter(r => r.status === 'leave').length;
 
     res.json({
       success: true,
@@ -359,10 +364,13 @@ const getDailySummary = async (req, res) => {
           late,
           absent,
           leave: onLeave,
-          notCheckedIn: totalEmp - logs.rows.length,
+          rejected: rejected.length,
+          // rejected rows are treated as if the employee never checked in
+          notCheckedIn: totalEmp - counted.length,
           attendanceRate: parseFloat(((present + late) / totalEmp * 100).toFixed(1))
         },
-        records: logs.rows
+        records: counted,
+        rejectedRecords: rejected,
       }
     });
   } catch (err) {
@@ -399,9 +407,10 @@ const getRecentSummary = async (req, res) => {
               COUNT(*) FILTER (WHERE status = 'absent')::int                      AS absent,
               COUNT(*) FILTER (WHERE status = 'leave')::int                       AS leave,
               COUNT(*) FILTER (WHERE status = 'very_late')::int                   AS very_late
-       FROM attendance_logs
-       WHERE date BETWEEN $1 AND $2
-       GROUP BY date`,
+         FROM attendance_logs
+        WHERE date BETWEEN $1 AND $2
+          AND NOT (is_offsite = true AND offsite_status = 'rejected')
+        GROUP BY date`,
       [start, stop]
     );
     const byDate = {};
@@ -530,13 +539,17 @@ const getMyHistory = async (req, res) => {
       [empResult.rows[0].id, month || nowLocal().month() + 1, year || nowLocal().year()]
     );
 
+    // Rejected off-site requests don't contribute to the personal totals;
+    // the rows stay in `records` so the employee can still see them with
+    // the rejected badge.
+    const counted = result.rows.filter(r => !(r.is_offsite && r.offsite_status === 'rejected'));
     const summary = {
-      present:    result.rows.filter(r => r.status === 'present').length,
-      almostLate: result.rows.filter(r => r.status === 'present' && r.almost_late).length,
-      late:       result.rows.filter(r => r.status === 'late').length,
-      absent:     result.rows.filter(r => r.status === 'absent').length,
-      totalWorkHours: result.rows.reduce((s, r) => s + (parseFloat(r.work_hours) || 0), 0).toFixed(1),
-      totalOtHours:   result.rows.reduce((s, r) => s + (parseFloat(r.ot_hours)   || 0), 0).toFixed(1),
+      present:    counted.filter(r => r.status === 'present').length,
+      almostLate: counted.filter(r => r.status === 'present' && r.almost_late).length,
+      late:       counted.filter(r => r.status === 'late').length,
+      absent:     counted.filter(r => r.status === 'absent').length,
+      totalWorkHours: counted.reduce((s, r) => s + (parseFloat(r.work_hours) || 0), 0).toFixed(1),
+      totalOtHours:   counted.reduce((s, r) => s + (parseFloat(r.ot_hours)   || 0), 0).toFixed(1),
     };
 
     res.json({ success: true, data: { summary, records: result.rows } });
