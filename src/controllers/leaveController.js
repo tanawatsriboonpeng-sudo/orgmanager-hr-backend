@@ -147,12 +147,12 @@ const MAX_DOCUMENT_BYTES = 2 * 1024 * 1024;
 // is positive — a clamped 0 means "too long; tell the user".
 const MAX_LEAVE_SPAN_DAYS = 366;
 
-// Walk the date range and count working days (Mon–Fri). Pulled out of
-// createRequest so adminCreateLeave can reuse it without duplicating the
-// loop. Returns 0 when the span exceeds MAX_LEAVE_SPAN_DAYS so callers
-// can surface a clean validation error rather than letting the server
-// burn CPU on an abusive payload.
-function countWorkingDays(start, end) {
+// Walk the date range and count working days. A working day is Mon–Fri
+// AND not a row in the `holidays` table for that date. `holidaySet` is
+// a Set<'YYYY-MM-DD'> the caller builds once via fetchHolidaysInRange.
+// Returns 0 when the span exceeds MAX_LEAVE_SPAN_DAYS so callers
+// surface a clean validation error rather than burn CPU.
+function countWorkingDays(start, end, holidaySet = new Set()) {
   const startD = dayjs(start);
   const endD = dayjs(end);
   if (!startD.isValid() || !endD.isValid()) return 0;
@@ -161,10 +161,49 @@ function countWorkingDays(start, end) {
   let n = 0;
   let cur = startD;
   while (!cur.isAfter(endD)) {
-    if (cur.day() !== 0 && cur.day() !== 6) n++;
+    const dow = cur.day();
+    const ymd = cur.format('YYYY-MM-DD');
+    if (dow !== 0 && dow !== 6 && !holidaySet.has(ymd)) n++;
     cur = cur.add(1, 'day');
   }
   return n;
+}
+
+// "Straddle": a non-working day (weekend or holiday) sits BETWEEN two
+// working days inside the requested range. Company policy requires
+// each leave block to be one contiguous run of working days — anything
+// that jumps across a holiday/weekend must be filed as two separate
+// requests so HR can act on each side independently.
+function straddlesNonWorking(start, end, holidaySet = new Set()) {
+  const startD = dayjs(start);
+  const endD = dayjs(end);
+  if (!startD.isValid() || !endD.isValid()) return false;
+  if (endD.diff(startD, 'day') > MAX_LEAVE_SPAN_DAYS) return false;
+  let cur = startD;
+  let sawNonWorking = false;
+  while (!cur.isAfter(endD)) {
+    const dow = cur.day();
+    const ymd = cur.format('YYYY-MM-DD');
+    const isWorking = dow !== 0 && dow !== 6 && !holidaySet.has(ymd);
+    if (isWorking && sawNonWorking) return true;
+    if (!isWorking) sawNonWorking = true;
+    cur = cur.add(1, 'day');
+  }
+  return false;
+}
+
+// One query per request to grab the holidays in the range. Returns an
+// empty set if the table is missing (legacy DBs degrade to weekend-only).
+async function fetchHolidaysInRange(start, end) {
+  try {
+    const r = await query(
+      `SELECT TO_CHAR(date, 'YYYY-MM-DD') AS d FROM holidays WHERE date BETWEEN $1 AND $2`,
+      [start, end]
+    );
+    return new Set(r.rows.map(x => x.d));
+  } catch {
+    return new Set();
+  }
 }
 
 // POST /api/leave/request
@@ -228,7 +267,19 @@ const createRequest = async (req, res) => {
       }
     }
 
-    const daysCount = countWorkingDays(start, end);
+    // Holiday-aware working-day count + straddle check. Fetched once
+    // so we don't double-query inside the helpers.
+    const holidaySet = await fetchHolidaysInRange(
+      start.format('YYYY-MM-DD'),
+      end.format('YYYY-MM-DD')
+    );
+    if (straddlesNonWorking(start.format('YYYY-MM-DD'), end.format('YYYY-MM-DD'), holidaySet)) {
+      return res.status(400).json({
+        success: false,
+        message: 'ช่วงที่เลือกคร่อมวันหยุด/วันหยุดราชการ — กรุณาแยกยื่นเป็น 2 ครั้ง (ก่อน-หลังวันหยุด)',
+      });
+    }
+    const daysCount = countWorkingDays(start, end, holidaySet);
     if (daysCount === 0) {
       return res.status(400).json({ success: false, message: 'ช่วงที่เลือกไม่มีวันทำงาน' });
     }
@@ -737,7 +788,19 @@ const adminCreateLeave = async (req, res) => {
   if (end.isBefore(start)) {
     return res.status(400).json({ success: false, message: 'วันสิ้นสุดต้องหลังวันเริ่มต้น' });
   }
-  const daysCount = countWorkingDays(start, end);
+  // Same holiday/straddle rule as createRequest — admin record must
+  // also follow the "split across a holiday" policy.
+  const holidaySet = await fetchHolidaysInRange(
+    start.format('YYYY-MM-DD'),
+    end.format('YYYY-MM-DD')
+  );
+  if (straddlesNonWorking(start.format('YYYY-MM-DD'), end.format('YYYY-MM-DD'), holidaySet)) {
+    return res.status(400).json({
+      success: false,
+      message: 'ช่วงที่เลือกคร่อมวันหยุด/วันหยุดราชการ — กรุณาแยกเป็น 2 รายการ',
+    });
+  }
+  const daysCount = countWorkingDays(start, end, holidaySet);
   if (daysCount === 0) {
     return res.status(400).json({ success: false, message: 'ช่วงที่เลือกไม่มีวันทำงาน' });
   }
@@ -839,10 +902,97 @@ const adminCreateLeave = async (req, res) => {
   }
 };
 
+// POST /api/leave/:id/cancel-approved
+// HR/owner only. Voids an already-approved leave: refunds the quota,
+// deletes the leave-marked attendance rows for the day range, flips
+// the request to 'cancelled', and notifies the affected employee.
+// Wrapped in a single transaction so the three writes either all
+// land or none do — half-rolled-back state would corrupt quotas.
+const cancelApproved = async (req, res) => {
+  const { id } = req.params;
+  const { reason } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const leaveRes = await client.query('SELECT * FROM leave_requests WHERE id = $1', [id]);
+    if (!leaveRes.rows[0]) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'ไม่พบคำขอ' });
+    }
+    const leave = leaveRes.rows[0];
+    if (leave.status !== 'approved') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        success: false,
+        message: `ยกเลิกได้เฉพาะคำขอที่อนุมัติแล้ว (สถานะปัจจุบัน: ${leave.status})`,
+      });
+    }
+
+    // 1. Flip status
+    await client.query(
+      `UPDATE leave_requests
+          SET status = 'cancelled',
+              hr_notes = COALESCE($1, hr_notes),
+              updated_at = NOW()
+        WHERE id = $2`,
+      [reason || null, id]
+    );
+
+    // 2. Refund quota. We don't persist the deduct-or-not flag on the
+    //    request row, so we always attempt a refund — GREATEST(0, …)
+    //    keeps used_days from going negative on the rare admin path
+    //    that originally skipped deduction.
+    await client.query(
+      `UPDATE leave_quotas
+          SET used_days = GREATEST(0, used_days - $1)
+        WHERE employee_id = $2
+          AND leave_type_id = $3
+          AND year = EXTRACT(YEAR FROM $4::date)`,
+      [leave.days_count, leave.employee_id, leave.leave_type_id, leave.start_date]
+    );
+
+    // 3. Remove the 'leave'-status attendance rows for the day range.
+    //    Only delete rows that were created by this leave (status='leave')
+    //    so we don't accidentally erase a real check-in someone had
+    //    backdated for the same day after the leave was approved.
+    await client.query(
+      `DELETE FROM attendance_logs
+        WHERE employee_id = $1
+          AND date BETWEEN $2 AND $3
+          AND status = 'leave'`,
+      [leave.employee_id, leave.start_date, leave.end_date]
+    );
+
+    await client.query('COMMIT');
+
+    // Notify the affected employee outside the transaction (notify is
+    // fire-and-forget; failure shouldn't block the cancel).
+    const empUserId = await userIdFromEmployee(leave.employee_id);
+    const typeRow = await query('SELECT name FROM leave_types WHERE id = $1', [leave.leave_type_id]);
+    const typeName = typeRow.rows[0]?.name || 'การลา';
+    const rangeText = `${typeName} ${dayjs(leave.start_date).format('D MMM')}–${dayjs(leave.end_date).format('D MMM')} (${leave.days_count} วัน)`;
+    notify(empUserId, {
+      type: 'leave_cancelled',
+      title: 'คำขอลาที่อนุมัติแล้วถูกยกเลิก',
+      body: reason ? `${rangeText} · เหตุผล: ${reason}` : rangeText,
+      link: '/leave',
+      relatedId: id,
+    });
+
+    res.json({ success: true, message: 'ยกเลิกคำขอลาที่อนุมัติแล้ว' });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('POST /leave/:id/cancel-approved error:', err.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  } finally {
+    client.release();
+  }
+};
+
 module.exports = {
   getLeaveTypes, getAllLeaveTypes,
   createLeaveType, updateLeaveType, deleteLeaveType,
   getMyQuota, getAllQuotas, setQuota, seedDefaultQuotas,
   createRequest, getPending, approveRequest, getMyHistory, cancelRequest,
-  getAllRequests, adminCreateLeave,
+  getAllRequests, adminCreateLeave, cancelApproved,
 };
