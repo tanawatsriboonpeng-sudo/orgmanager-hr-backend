@@ -280,7 +280,7 @@ router.get('/employees/my-subordinates', authenticate, async (req, res) => {
 router.get('/employees/me', authenticate, async (req, res) => {
   try {
     const result = await query(
-      `SELECT e.*, u.email, d.name as department_name,
+      `SELECT e.*, u.email, u.line_user_id, d.name as department_name,
               m.first_name as manager_first_name, m.last_name as manager_last_name
        FROM employees e
        LEFT JOIN users u ON e.user_id = u.id
