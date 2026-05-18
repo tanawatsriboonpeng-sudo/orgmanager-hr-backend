@@ -42,7 +42,14 @@ const MAX_TOOL_ITERATIONS = 10;         // hard cap on tool-loop turns
 const MAX_OUTPUT_TOKENS   = 1024;
 const MAX_USER_MESSAGE_CHARS = 4000;    // truncate absurdly long inputs
 const MAX_HISTORY_MESSAGES   = 20;      // last N messages kept (excl. system)
-const DAILY_MESSAGE_QUOTA    = 30;      // per user, resets at Bangkok midnight
+const DAILY_MESSAGE_QUOTA    = 30;      // per employee, resets at Bangkok midnight
+                                        // owner/hr are unlimited — they
+                                        // use chat for admin work (drafting,
+                                        // approving, ticket responses) so a
+                                        // 30-msg cap would block real
+                                        // workflows. Cost containment for
+                                        // admins is owner's responsibility
+                                        // via the Anthropic spend limit.
 
 // =====================================================================
 // SYSTEM PROMPT
@@ -1497,14 +1504,20 @@ const chat = async (req, res) => {
       departmentId: emp?.department_id || null,
     };
 
-    // Rate limit
-    const usageBefore = getUsage(ctx.userId);
-    if (usageBefore.count >= DAILY_MESSAGE_QUOTA) {
-      return res.status(429).json({
-        success: false,
-        message: `วันนี้คุณใช้ AI ครบโควต้า ${DAILY_MESSAGE_QUOTA} ข้อความแล้ว ลองใหม่พรุ่งนี้`,
-        usage: usageBefore,
-      });
+    // Rate limit — employees only. Owner/HR are unlimited (admin
+    // workflows like ticket-triage + multi-step approvals routinely
+    // burn 5-10 messages each; capping them at 30/day would block
+    // real work).
+    const isAdminRole = ctx.role === 'owner' || ctx.role === 'hr';
+    if (!isAdminRole) {
+      const usageBefore = getUsage(ctx.userId);
+      if (usageBefore.count >= DAILY_MESSAGE_QUOTA) {
+        return res.status(429).json({
+          success: false,
+          message: `วันนี้คุณใช้ AI ครบโควต้า ${DAILY_MESSAGE_QUOTA} ข้อความแล้ว ลองใหม่พรุ่งนี้`,
+          usage: usageBefore,
+        });
+      }
     }
 
     // Validate + sanitize messages.
@@ -1623,7 +1636,9 @@ const chat = async (req, res) => {
       lastReply = 'ขออภัย ไม่สามารถสร้างคำตอบได้ในตอนนี้';
     }
 
-    const usageAfter = bumpUsage(ctx.userId);
+    // Only count usage for employees; admins are unlimited (and the
+    // frontend hides the counter for them).
+    const usageAfter = isAdminRole ? null : bumpUsage(ctx.userId);
 
     return res.json({
       success: true,
@@ -1633,8 +1648,8 @@ const chat = async (req, res) => {
         iterations,
         stop_reason,
         usage: {
-          message_count_today: usageAfter.count,
-          daily_quota: DAILY_MESSAGE_QUOTA,
+          message_count_today: usageAfter ? usageAfter.count : 0,
+          daily_quota: isAdminRole ? null : DAILY_MESSAGE_QUOTA,
           tokens: usageTotals,
         },
       },
@@ -1765,15 +1780,18 @@ ${t.hr_response ? `\n(หมายเหตุ: เคยตอบไปแล�
 
 // GET /api/ai/status — frontend uses this to decide whether to render
 // the chat widget at all. Returns { enabled, dailyQuota, used }.
+// daily_quota=null means "unlimited" (owner/HR). The frontend hides the
+// "N/M ข้อความวันนี้" counter when the quota is null.
 const status = async (req, res) => {
   const enabled = !!process.env.ANTHROPIC_API_KEY;
-  const used = req.user?.id ? getUsage(req.user.id).count : 0;
+  const isAdminRole = req.user?.role === 'owner' || req.user?.role === 'hr';
+  const used = req.user?.id && !isAdminRole ? getUsage(req.user.id).count : 0;
   return res.json({
     success: true,
     data: {
       enabled,
       model: MODEL,
-      daily_quota: DAILY_MESSAGE_QUOTA,
+      daily_quota: isAdminRole ? null : DAILY_MESSAGE_QUOTA,
       used_today: used,
     },
   });
