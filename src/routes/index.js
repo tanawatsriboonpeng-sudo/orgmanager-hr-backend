@@ -234,8 +234,16 @@ router.patch('/ot/:id/approve', authenticate, authorize('hr', 'owner'),
 
     res.json({ success: true, message: action === 'approved' ? 'อนุมัติ OT แล้ว' : 'ปฏิเสธ OT แล้ว' });
   } catch (e) {
-    console.error('PATCH /ot/:id/approve error:', e.message);
-    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+    // Diagnostic: surface the underlying error to HR/owner (this
+    // endpoint is already authorize('hr','owner')) so we can fix
+    // approve/reject failures without round-tripping through Render
+    // logs. Stack + Postgres detail/where get logged too.
+    console.error('PATCH /ot/:id/approve error:', e.message, e.stack, e.detail, e.where);
+    res.status(500).json({
+      success: false,
+      message: 'เกิดข้อผิดพลาด',
+      debug: { code: e.code, message: e.message, detail: e.detail, where: e.where, constraint: e.constraint },
+    });
   }
 });
 
