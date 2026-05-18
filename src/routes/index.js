@@ -6,6 +6,7 @@ const attendCtrl = require('../controllers/attendanceController');
 const leaveCtrl = require('../controllers/leaveController');
 const retentionCtrl = require('../controllers/retentionController');
 const supportCtrl = require('../controllers/supportController');
+const aiCtrl = require('../controllers/aiController');
 const { query, pool } = require('../../config/database');
 const { notify, notifyManyByRole, userIdFromEmployee } = require('../middleware/notify');
 const dayjsForNotif = require('dayjs');
@@ -3896,5 +3897,17 @@ router.post('/support/tickets/:id/close', authenticate,
 router.post('/support/tickets/:id/reopen', authenticate,
   auditLog('support_ticket_reopen', 'support_tickets'),
   supportCtrl.reopen);
+
+// ====== AI CHATBOT ======
+// Employee-facing chat assistant. All tools are scoped server-side to the
+// caller's own employee record. /status lets the frontend hide the widget
+// when no API key is configured. Audit-log the chat itself so we can
+// retroactively see who used the assistant and roughly how often (the
+// message bodies live in the user's browser, not in audit_logs).
+router.get('/ai/status', authenticate, aiCtrl.status);
+router.post('/ai/chat',
+  authenticate,
+  auditLog('ai_chat', 'ai'),
+  aiCtrl.chat);
 
 module.exports = router;
