@@ -481,6 +481,36 @@ async function ensureSchema() {
       ALTER TABLE shift_configs
       ADD COLUMN IF NOT EXISTS min_work_minutes INT DEFAULT 30
     `);
+    // Self-heal ot_requests on legacy prod DBs that predate the
+    // manager/HR approval columns. The PATCH /ot/:id/approve handler
+    // writes to all of these — without the columns the UPDATE fails
+    // with Postgres 42703 and HR sees a generic 500 in the UI.
+    // Same defensive-ALTER pattern we used for audit_logs.
+    const otColumns = [
+      ['rate',                'NUMERIC(3,1) DEFAULT 1.5'],
+      ['manager_approved_by', 'UUID REFERENCES users(id)'],
+      ['manager_approved_at', 'TIMESTAMPTZ'],
+      ['hr_approved_by',      'UUID REFERENCES users(id)'],
+      ['hr_approved_at',      'TIMESTAMPTZ'],
+      ['rejected_reason',     'TEXT'],
+      ['updated_at',          'TIMESTAMPTZ DEFAULT NOW()'],
+    ];
+    for (const [name, type] of otColumns) {
+      await client.query(
+        `ALTER TABLE ot_requests ADD COLUMN IF NOT EXISTS ${name} ${type}`
+      );
+    }
+    // Old prod CHECK constraint may have allowed only ('pending',
+    // 'approved', 'rejected') — newer code writes 'hr_approved' and
+    // 'manager_approved' too. Drop + recreate to match migrate.js.
+    await client.query(`
+      ALTER TABLE ot_requests DROP CONSTRAINT IF EXISTS ot_requests_status_check
+    `);
+    await client.query(`
+      ALTER TABLE ot_requests
+        ADD CONSTRAINT ot_requests_status_check
+        CHECK (status IN ('pending','manager_approved','hr_approved','rejected'))
+    `);
     // Payroll. Legacy DBs created before migrate.js added payroll_records
     // won't have this table, so create it defensively on every boot.
     // net_salary is a GENERATED column — Postgres recomputes it on every
