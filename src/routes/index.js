@@ -1944,11 +1944,59 @@ async function resolveOwnEmployeeId(userId) {
 router.get('/payroll', authenticate, async (req, res) => {
   const { month, year, status, employeeId } = req.query;
   try {
+    const isManager = req.user.role === 'hr' || req.user.role === 'owner';
+
+    // === HR/owner with a specific month+year: include slipless rows ===
+    //
+    // When HR opens /payroll filtered to a month, they want to see EVERY
+    // employee for that period — including the ones who don't have a
+    // slip yet (e.g. just got hired after the last bulk-generate). The
+    // previous query was `FROM payroll_records p JOIN employees e` which
+    // hid those new hires entirely; HR had to know to re-click "สร้าง
+    // สลิปประจำเดือน" to discover them.
+    //
+    // Now: drive the list from employees, LEFT JOIN payroll_records for
+    // the target month. Rows without a matching slip come back with
+    // p.id = NULL — the frontend renders those with a "ยังไม่มีสลิป"
+    // badge and a one-click create button. Status filter is incompatible
+    // with the "slipless" concept, so we keep the old join when status
+    // is set.
+    if (isManager && month && year && !status) {
+      const m = parseInt(month, 10);
+      const y = parseInt(year, 10);
+      const params = [m, y];
+      const empFilter = employeeId ? ` AND e.id = $${params.push(employeeId)}` : '';
+      const r = await query(
+        `SELECT p.id, p.month, p.year,
+                p.base_salary, p.ot_amount, p.bonus, p.allowances,
+                p.social_security, p.income_tax, p.other_deductions,
+                p.net_salary, p.work_days, p.absent_days, p.late_count,
+                p.ot_hours, p.status, p.notes, p.paid_at, p.slip_sent_at,
+                p.created_at,
+                e.id AS employee_id,
+                e.first_name, e.last_name, e.nickname, e.avatar_url,
+                e.employee_id AS emp_code, e.position,
+                d.name AS department_name
+           FROM employees e
+           LEFT JOIN users u ON e.user_id = u.id
+           LEFT JOIN payroll_records p
+             ON p.employee_id = e.id AND p.month = $1 AND p.year = $2
+           LEFT JOIN departments d ON e.department_id = d.id
+          WHERE e.is_active = true
+            AND (u.role IS NULL OR u.role <> 'owner')
+            ${empFilter}
+          ORDER BY (p.id IS NULL), e.first_name`,
+        params
+      );
+      return res.json({ success: true, data: r.rows });
+    }
+
+    // === Everyone else: existing behavior (slip-driven query) ===
     const where = [];
     const params = [];
     const push = (clause, value) => { params.push(value); where.push(clause.replace('$$', `$${params.length}`)); };
 
-    if (req.user.role !== 'hr' && req.user.role !== 'owner') {
+    if (!isManager) {
       const ownId = await resolveOwnEmployeeId(req.user.id);
       if (!ownId) return res.json({ success: true, data: [] });
       push('p.employee_id = $$', ownId);
@@ -3215,6 +3263,62 @@ router.put('/cleaning/inspector-queue', authenticate, authorize('hr', 'owner'),
         WHERE id = 1`,
       [unique.length]
     );
+    // Ripple the new queue order into today's still-editable session.
+    // Without this, reordering the queue only affects future days — but
+    // the user's mental model is "I changed the queue, today should
+    // reflect that too." We only touch sessions that haven't been
+    // finalized (open/rejected) AND where the inspector hasn't actually
+    // started filling things in (no rows with done_by or inspector
+    // notes), so we never overwrite real work.
+    const todayIso = bangkokDateISO();
+    const todaySess = await client.query(
+      `SELECT s.id, s.inspector_id, s.status
+         FROM cleaning_sessions s
+        WHERE s.session_date = $1
+          AND s.status IN ('open', 'rejected')`,
+      [todayIso]
+    );
+    if (todaySess.rows[0] && unique.length > 0) {
+      const sess = todaySess.rows[0];
+      // Pick the first ELIGIBLE employee from the new queue: must be
+      // active, not owner. This mirrors pickNextInspector() logic so
+      // a manual queue edit lands on the same person an automatic
+      // queue-advance would have picked.
+      const eligible = await client.query(
+        `SELECT q.employee_id
+           FROM cleaning_inspector_queue q
+           JOIN employees e ON q.employee_id = e.id
+           JOIN users u ON e.user_id = u.id
+          WHERE q.is_active = true
+            AND e.is_active = true
+            AND u.is_active = true
+            AND u.role <> 'owner'
+          ORDER BY q.position
+          LIMIT 1`
+      );
+      const newInspector = eligible.rows[0]?.employee_id || null;
+      if (newInspector && newInspector !== sess.inspector_id) {
+        // Only reassign if the inspector hasn't started yet — preserve
+        // any in-progress work by leaving the old inspector in place if
+        // they've already filled rows or written notes.
+        const inProgress = await client.query(
+          `SELECT 1 FROM cleaning_session_items
+            WHERE session_id = $1
+              AND (done_by_employee_id IS NOT NULL
+                   OR COALESCE(not_done, false) = true
+                   OR (inspector_note IS NOT NULL AND inspector_note <> ''))
+            LIMIT 1`,
+          [sess.id]
+        );
+        if (inProgress.rows.length === 0) {
+          await client.query(
+            `UPDATE cleaning_sessions SET inspector_id = $1, updated_at = NOW()
+              WHERE id = $2`,
+            [newInspector, sess.id]
+          );
+        }
+      }
+    }
     await client.query('COMMIT');
     res.json({ success: true, message: 'บันทึกคิวแล้ว', data: { count: unique.length } });
   } catch (e) {
