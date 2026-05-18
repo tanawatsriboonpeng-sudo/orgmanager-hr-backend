@@ -3218,15 +3218,23 @@ router.patch('/cleaning/settings', authenticate, authorize('hr', 'owner'),
     //     /cleaning/today will lazy-create the session (existing
     //     behavior), so no action needed here.
     const todayIso = bangkokDateISO();
+    // For time-patch we look at ANY status — owner expects the displayed
+    // times to reflect their latest schedule edit even on an already-
+    // approved session. The previous "open/rejected only" rule confused
+    // users ("ฉันตั้งเวลาใหม่แล้ว ทำไมไม่ปรับ") and the audit_logs row
+    // already preserves the previous value, so historical accuracy isn't
+    // lost — it's just not displayed in the headline.
     const todaySess = await query(
       `SELECT s.id, s.status FROM cleaning_sessions s
-        WHERE s.session_date = $1
-          AND s.status IN ('open', 'rejected')`,
+        WHERE s.session_date = $1`,
       [todayIso]
     );
     if (todaySess.rows[0]) {
       const sess = todaySess.rows[0];
       // (1) Time patch — only if either field was provided in the body.
+      //     Applies to ALL statuses (open/rejected/inspector_reviewed/
+      //     approved). Times are display-only after approval, and the
+      //     owner is the one driving the change.
       if (startTime || endTime) {
         await query(
           `UPDATE cleaning_sessions SET
@@ -3237,10 +3245,13 @@ router.patch('/cleaning/settings', authenticate, authorize('hr', 'owner'),
           [startTime || null, endTime || null, sess.id]
         );
       }
-      // (2) Today removed from schedule — delete if untouched. We
-      // compute "today's DOW dropped" against the EFFECTIVE settings
-      // after the UPDATE above. Reading them back keeps the logic
-      // simple (no need to merge partial body + existing row).
+      // (2) Today removed from schedule — delete if untouched AND not
+      // yet finalized. We compute "today's DOW dropped" against the
+      // EFFECTIVE settings after the UPDATE above. Reading them back
+      // keeps the logic simple (no need to merge partial body + existing
+      // row). The 'open'/'rejected' gate stays — we never delete a
+      // session that's been reviewed or approved, that would destroy
+      // real work.
       const settingsAfter = await query(
         `SELECT weekdays, is_active FROM cleaning_settings WHERE id = 1`
       );
@@ -3248,10 +3259,12 @@ router.patch('/cleaning/settings', authenticate, authorize('hr', 'owner'),
       const effectiveActive = settingsAfter.rows[0]?.is_active !== false;
       const todayDow = dayjsForNotif.tz(todayIso, APP_TZ).day();
       const todayShouldRun = effectiveActive && effectiveWeekdays.includes(todayDow);
-      if (!todayShouldRun) {
+      if (!todayShouldRun && (sess.status === 'open' || sess.status === 'rejected')) {
         // Untouched = no done_by, no not_done flag, no inspector notes
         // on ANY item. If the inspector started, keep the session as-is
-        // so we don't erase real work.
+        // so we don't erase real work. Also: we only delete open/
+        // rejected sessions — a reviewed or approved session is real
+        // history, never delete those regardless of schedule edits.
         const inProgress = await query(
           `SELECT 1 FROM cleaning_session_items
             WHERE session_id = $1
