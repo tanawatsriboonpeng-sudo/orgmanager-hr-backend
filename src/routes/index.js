@@ -3194,6 +3194,43 @@ router.patch('/cleaning/settings', authenticate, authorize('hr', 'owner'),
     }
     validWeekdays = [...new Set(weekdays)].sort();
   }
+  // Validate time format + ordering. Backend is the trust boundary:
+  // frontend already blocks the save when end <= start, but a direct
+  // POST or a stale client could still submit a bad payload and silently
+  // corrupt today's schedule. Reject both individually-malformed values
+  // and out-of-order pairs with actionable Thai error messages.
+  const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+  if (startTime != null && !TIME_RE.test(String(startTime))) {
+    return res.status(400).json({ success: false, message: 'รูปแบบเวลาเริ่มไม่ถูกต้อง (HH:MM)' });
+  }
+  if (endTime != null && !TIME_RE.test(String(endTime))) {
+    return res.status(400).json({ success: false, message: 'รูปแบบเวลาสิ้นสุดไม่ถูกต้อง (HH:MM)' });
+  }
+  // Validate the EFFECTIVE pair (request value if present, else what's
+  // currently stored). Catches the partial-update case where the user
+  // sends only startTime but the merge with the stored endTime would
+  // still create an inverted window.
+  if (startTime != null || endTime != null) {
+    const cur = await query(
+      `SELECT TO_CHAR(start_time, 'HH24:MI') AS start_time,
+              TO_CHAR(end_time,   'HH24:MI') AS end_time
+         FROM cleaning_settings WHERE id = 1`
+    );
+    const effStart = (startTime ?? cur.rows[0]?.start_time);
+    const effEnd   = (endTime   ?? cur.rows[0]?.end_time);
+    if (effStart && effEnd) {
+      const toMin = (hhmm) => {
+        const [h, m] = String(hhmm).split(':').map(Number);
+        return h * 60 + m;
+      };
+      if (toMin(effEnd) <= toMin(effStart)) {
+        return res.status(400).json({
+          success: false,
+          message: 'เวลาสิ้นสุดต้องอยู่หลังเวลาเริ่ม',
+        });
+      }
+    }
+  }
   try {
     await query(
       `UPDATE cleaning_settings SET
