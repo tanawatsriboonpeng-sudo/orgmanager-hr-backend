@@ -421,8 +421,16 @@ const checkOut = async (req, res) => {
 
     // Resolve today's shift config so we can both (a) enforce the
     // min-work-minutes floor and (b) compute the checkout status.
+    //
+    // Default lowered from 30 → 5: the 30-minute floor was blocking
+    // legit early-leavers (sick, family emergency, manager said go
+    // home) and pushing them to ask HR to fix the record. 5 minutes
+    // is still enough to catch the "tap in, immediately tap out by
+    // mistake" pattern that motivated this guard. HR can raise the
+    // floor per shift via shift_configs.min_work_minutes if their
+    // policy is stricter.
     const { config: shiftCfg } = await resolveShiftConfig(empId, today);
-    const minWorkMin = shiftCfg?.min_work_minutes ?? 30;
+    const minWorkMin = shiftCfg?.min_work_minutes ?? 5;
     const elapsedMin = checkOutAt.diff(checkInAt, 'minute');
     if (elapsedMin < minWorkMin) {
       return res.status(400).json({
@@ -482,8 +490,12 @@ const checkOut = async (req, res) => {
       }
     });
   } catch (err) {
-    console.error('POST /attendance/check-out error:', err.message);
-    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+    // Surface the real cause in the response so the user can tell
+    // us what's failing without trawling Render logs. Endpoint is
+    // employee-self-only (uses req.user.id implicitly), so there's
+    // no PII risk in echoing the message.
+    console.error('POST /attendance/check-out error:', err);
+    res.status(500).json({ success: false, message: `เกิดข้อผิดพลาด: ${err.message}` });
   }
 };
 

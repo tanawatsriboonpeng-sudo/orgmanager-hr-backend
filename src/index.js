@@ -482,12 +482,14 @@ async function ensureSchema() {
       );
     }
     // Minimum minutes between check-in and check-out before the
-    // checkout is accepted. Default 30 — blocks the "tap in, tap
-    // out 5 minutes later" pattern while still letting half-day
-    // dismissals through (those should go through /leave anyway).
+    // checkout is accepted. Default 5 — just enough to block the
+    // "tap in, immediately tap out by mistake" pattern. Was 30
+    // initially but that blocked legit early-leavers (sick, manager
+    // sent home, etc.) and pushed them to ask HR to fix records.
+    // HR can raise the floor per shift if their policy is stricter.
     await client.query(`
       ALTER TABLE shift_configs
-      ADD COLUMN IF NOT EXISTS min_work_minutes INT DEFAULT 30
+      ADD COLUMN IF NOT EXISTS min_work_minutes INT DEFAULT 5
     `);
     // Self-heal ot_requests on legacy prod DBs that predate the
     // manager/HR approval columns. The PATCH /ot/:id/approve handler
