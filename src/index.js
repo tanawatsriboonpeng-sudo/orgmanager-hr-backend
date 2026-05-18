@@ -211,6 +211,14 @@ async function ensureSchema() {
       ['payment_method',     'VARCHAR(20)'],   // transfer/cash/cheque
       ['tax_id',             'VARCHAR(20)'],
       ['national_id',        'VARCHAR(20)'],
+      // Recurring payroll deductions — populated from the employee
+      // profile so HR doesn't have to retype the same amount every
+      // month. payroll/bulk-generate snapshots these into each new
+      // slip, then the slip is editable per-month if needed.
+      ['student_loan_id',      'VARCHAR(50)'],     // เลขผู้กู้ กยศ./กรอ.
+      ['student_loan_monthly', 'NUMERIC(12,2) DEFAULT 0'],  // ยอดหักต่อเดือน
+      ['deposit_monthly',      'NUMERIC(12,2) DEFAULT 0'],  // เงินประกัน/เดือน
+      ['deposit_accumulated',  'NUMERIC(12,2) DEFAULT 0'],  // ยอดสะสมแล้ว
       // Free-form
       ['notes',              'TEXT'],
       ['hashtags',           'TEXT[]'],
@@ -550,6 +558,47 @@ async function ensureSchema() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_payroll_period ON payroll_records(year, month)
     `);
+    // Payslip detail fields added to match the FlowAccount-style slip
+    // layout. All default to 0 so existing slips keep the same net.
+    const payrollExtraCols = [
+      ['commission',            'NUMERIC(12,2) DEFAULT 0'],
+      ['other_earnings',        'NUMERIC(12,2) DEFAULT 0'],
+      ['student_loan',          'NUMERIC(12,2) DEFAULT 0'],
+      ['deposit',               'NUMERIC(12,2) DEFAULT 0'],
+      ['absent_late_deduction', 'NUMERIC(12,2) DEFAULT 0'],
+    ];
+    for (const [name, type] of payrollExtraCols) {
+      await client.query(
+        `ALTER TABLE payroll_records ADD COLUMN IF NOT EXISTS ${name} ${type}`
+      );
+    }
+    // net_salary is GENERATED — Postgres won't let us modify the
+    // expression in place. We detect the old (pre-extension) formula
+    // by checking whether it references the new `commission` column;
+    // if not, DROP + recreate with the full sum. Idempotent on
+    // subsequent boots because the second time around the new
+    // formula already references `commission`.
+    {
+      const expr = await client.query(`
+        SELECT pg_get_generation_expression(a.attrelid, a.attname) AS expr
+          FROM pg_attribute a
+         WHERE a.attrelid = 'payroll_records'::regclass
+           AND a.attname  = 'net_salary'
+           AND a.attgenerated <> ''
+      `);
+      const current = expr.rows[0]?.expr || '';
+      if (!current.includes('commission')) {
+        await client.query(`ALTER TABLE payroll_records DROP COLUMN IF EXISTS net_salary`);
+        await client.query(`
+          ALTER TABLE payroll_records
+          ADD COLUMN net_salary NUMERIC(12,2) GENERATED ALWAYS AS (
+              base_salary + ot_amount + bonus + allowances + commission + other_earnings
+            - social_security - income_tax - other_deductions
+            - student_loan - deposit - absent_late_deduction
+          ) STORED
+        `);
+      }
+    }
     // Singleton org-wide settings (company name, address, etc.).
     // Enforced single-row via PK = 1; everything else is a nullable column.
     // Read by anyone authenticated; write by owner only (enforced in routes).

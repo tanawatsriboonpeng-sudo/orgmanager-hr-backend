@@ -376,6 +376,10 @@ router.get('/employees', authenticate, authorize('hr', 'owner'), async (req, res
               e.shift_type, e.phone,
               e.work_days, e.weekly_shifts,
               e.is_active, e.base_salary,
+              -- Recurring payroll deductions — needed by the SlipAmountsForm
+              -- pre-fill (pulls these into a fresh slip via onEmployeeChange).
+              e.student_loan_id, e.student_loan_monthly,
+              e.deposit_monthly, e.deposit_accumulated,
               u.email, u.role, u.is_active as account_active, u.last_login_at,
               d.name as department_name,
               m.first_name as manager_first_name, m.last_name as manager_last_name
