@@ -234,15 +234,15 @@ router.patch('/ot/:id/approve', authenticate, authorize('hr', 'owner'),
 
     res.json({ success: true, message: action === 'approved' ? 'อนุมัติ OT แล้ว' : 'ปฏิเสธ OT แล้ว' });
   } catch (e) {
-    // Diagnostic: surface the underlying error to HR/owner (this
-    // endpoint is already authorize('hr','owner')) so we can fix
-    // approve/reject failures without round-tripping through Render
-    // logs. Stack + Postgres detail/where get logged too.
-    console.error('PATCH /ot/:id/approve error:', e.message, e.stack, e.detail, e.where);
+    // Endpoint is authorize('hr','owner'), so surfacing a tight error
+    // envelope (Postgres code + constraint name only) is acceptable —
+    // it cut diagnosis time on the missing-column bug from "wait for
+    // Render logs" to a single retry. Full message stays server-side.
+    console.error('PATCH /ot/:id/approve error:', e.message);
     res.status(500).json({
       success: false,
       message: 'เกิดข้อผิดพลาด',
-      debug: { code: e.code, message: e.message, detail: e.detail, where: e.where, constraint: e.constraint },
+      debug: { code: e.code, constraint: e.constraint },
     });
   }
 });
