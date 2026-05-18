@@ -359,15 +359,29 @@ async function ensureSchema() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_backdate_employee ON attendance_backdate_requests(employee_id, created_at DESC)
     `);
-    // Missing-checkout policy: if an employee checked in but never
-    // tapped เช็คเอาท์ before the day ended, work_hours stays 0 by
-    // default. The sweep endpoint sets missing_checkout=true and writes
-    // a halved work_hours (0.5 × shift length) so the employee gets
-    // partial credit; once the flag is true the sweep skips that row.
-    // Notifications fire to the employee + HR/owner when this happens.
+    // Missing-checkout policy (no auto-credit): an employee who checked
+    // in but never tapped เช็คเอาท์ keeps work_hours = 0 until they (or
+    // HR) submit a backdate-request with the real out-time. The system
+    // never invents a checkout; it just *nudges* across three layers:
+    //   - Layer 1 (live):       reminder near work_end so they remember
+    //                           before they leave the office.
+    //   - Layer 3 (banner):     past-day banner on /attendance + /
+    //                           dashboard asking them to file a
+    //                           backdate-request with the real out time.
+    //   - Layer 4 (HR digest):  next-morning HR roundup of yesterday's
+    //                           unclosed rows so management can chase.
+    //
+    // missing_checkout doubles as the "we've already alerted them" gate
+    // — set to true after the first across-the-bell ping so the sweep
+    // doesn't spam them every time it runs. work_hours stays 0.
+    // checkout_reminder_sent_at gates Layer 1 (one nudge per shift).
     await client.query(`
       ALTER TABLE attendance_logs
       ADD COLUMN IF NOT EXISTS missing_checkout BOOLEAN DEFAULT false
+    `);
+    await client.query(`
+      ALTER TABLE attendance_logs
+      ADD COLUMN IF NOT EXISTS checkout_reminder_sent_at TIMESTAMPTZ
     `);
     // One-time cleanup: older rows had ot_hours auto-calculated as
     // (work_hours - 8) whenever an employee stayed past 8 hours, which

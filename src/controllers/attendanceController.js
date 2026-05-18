@@ -1317,29 +1317,25 @@ const adminRecord = async (req, res) => {
   }
 };
 
-/* ===== Missing-checkout sweep ===== */
-// An employee who tapped เช็คอิน but never tapped เช็คเอาท์ before the
-// day ended would otherwise get 0 work hours for the day, and we'd
-// have to investigate manually. Policy: auto-mark such rows with
-// missing_checkout=true and credit them with HALF a day's hours
-// (computed from the shift, default 4). Each newly-marked row fires
-// a notification to the employee + every HR/owner so the negligence
-// is visible. The function is idempotent — already-marked rows are
-// skipped.
+/* ===== Missing-checkout sweep (notification-only, no auto-credit) =====
+ *
+ * An employee who tapped เช็คอิน but never tapped เช็คเอาท์ before the
+ * day ended keeps work_hours = 0. We do NOT invent a checkout time or
+ * credit half a day — the actual out-time has to come from a backdate
+ * request (employee) or admin-record (HR). The sweep's job is to send
+ * the *first* nudge and flip missing_checkout=true so the row appears
+ * in the past-missing banner on /attendance + /dashboard.
+ *
+ * Idempotent — already-flagged rows are skipped, so this can run as
+ * many times per day as /auth/me is hit without re-spamming the bell.
+ * Dayoff + holidays are excluded (you can't "forget" to check out on
+ * a day you weren't expected to work).
+ */
 async function sweepMissingCheckouts() {
-  // Pull every row that needs processing in one query. Date filter uses
-  // the local "today" so rows from earlier today (still potentially in
-  // progress) are not swept yet.
-  //
-  // LEFT JOIN holidays so we can drop rows where the employee
-  // technically tapped check-in on a public-holiday date (e.g. came
-  // in voluntarily, or HR backfilled it). Pulling weekly_shifts +
-  // computing dayoff in-loop is cheaper than rejoining with a
-  // synthetic table, and we already need shift_type below anyway.
   const today = nowLocal().format('YYYY-MM-DD');
   const r = await query(
     `SELECT a.id, a.employee_id, a.date, a.check_in_at,
-            e.shift_type, e.weekly_shifts,
+            e.weekly_shifts,
             CONCAT(e.first_name, ' ', e.last_name) AS emp_name,
             h.id AS holiday_id
        FROM attendance_logs a
@@ -1354,47 +1350,26 @@ async function sweepMissingCheckouts() {
   );
   let marked = 0;
   for (const row of r.rows) {
-    // Skip dayoff + holiday: an employee who came in on their day
-    // off (or a public holiday) shouldn't get the "you forgot to
-    // tap out" deduction since they weren't even expected to work.
     if (row.holiday_id) continue;
     const dowKey = String(dayjs(row.date).day());
     if (row.weekly_shifts && row.weekly_shifts[dowKey] === 'dayoff') continue;
-    // Use the shift configured for that date to know the full workday
-    // length; halve it. Fallback to 8h × 0.5 = 4h.
-    let standardHours = 8;
-    try {
-      const { config } = await resolveShiftConfig(row.employee_id, row.date);
-      if (config?.work_start && config?.work_end) {
-        const m = timeToMin(config.work_end) - timeToMin(config.work_start);
-        if (m > 0) standardHours = m / 60;
-      }
-    } catch { /* keep default */ }
-    const credited = +(standardHours * 0.5).toFixed(2);
 
+    // Flag-only update — work_hours intentionally untouched.
     await query(
       `UPDATE attendance_logs
           SET missing_checkout = true,
-              work_hours       = $1,
               updated_at       = NOW()
-        WHERE id = $2`,
-      [credited, row.id]
+        WHERE id = $1`,
+      [row.id]
     );
 
-    // Notify the employee.
+    // Personal nudge — direct CTA to file the backdate so their hours
+    // actually reflect what they worked.
     const empUserId = await userIdFromEmployee(row.employee_id);
     notify(empUserId, {
       type: 'attendance_missing_checkout',
-      title: 'คุณลืมลงเวลาออกงาน',
-      body: `${dayjs(row.date).format('D MMM')} · ระบบหักเวลาทำงานเหลือ ${credited} ชม. (ครึ่งวัน). ถ้าออกจริงหลังจากนี้ ยื่นคำขอลงเวลาย้อนหลังได้`,
-      link: '/attendance',
-      relatedId: row.id,
-    });
-    // Notify all HR + owner once per row so they can spot-check.
-    notifyManyByRole(['hr', 'owner'], {
-      type: 'attendance_missing_checkout_admin',
-      title: `${row.emp_name} ลืมลงเวลาออกงาน`,
-      body: `${dayjs(row.date).format('D MMM')} · ระบบหักเหลือ ${credited} ชม.`,
+      title: 'คุณลืมเช็คเอาท์',
+      body: `${dayjs(row.date).format('D MMM')} · ระบบไม่ได้บันทึกเวลาออก — กรุณายื่นคำขอลงเวลาย้อนหลังเพื่อระบุเวลาออกจริง`,
       link: '/attendance',
       relatedId: row.id,
     });
@@ -1403,35 +1378,160 @@ async function sweepMissingCheckouts() {
   return marked;
 }
 
-// Lazy daily wrapper. Was previously only called from getDailySummary
-// — i.e. when HR/owner opened /dashboard — which meant orphaned rows
-// could pile up for days if no one looked. Now /auth/me fires this
-// fire-and-forget on every authenticated request so missing-checkout
-// notifications reach the employee within ~minutes of the next time
-// anyone (HR or the employee themselves) opens the app.
+/* ===== Pre-end checkout reminder (Layer 1) =====
+ *
+ * Live nudge: while an employee is in the [work_end − 15 min, work_end
+ * + 30 min] window of their shift and hasn't tapped เช็คเอาท์ yet, send
+ * a one-shot reminder (bell + LINE) so they remember before walking out
+ * the door. Gated by attendance_logs.checkout_reminder_sent_at so each
+ * shift gets at most one ping.
+ */
+async function sweepCheckoutReminders() {
+  const today = nowLocal().format('YYYY-MM-DD');
+  // Candidates: checked-in today, not checked-out, not yet pinged.
+  const r = await query(
+    `SELECT a.id, a.employee_id, a.date,
+            e.weekly_shifts, e.shift_type,
+            CONCAT(e.first_name, ' ', e.last_name) AS emp_name
+       FROM attendance_logs a
+       JOIN employees e ON a.employee_id = e.id
+      WHERE a.check_in_at IS NOT NULL
+        AND a.check_out_at IS NULL
+        AND a.date = $1::date
+        AND a.checkout_reminder_sent_at IS NULL
+        AND e.is_active = true`,
+    [today]
+  );
+  if (r.rows.length === 0) return 0;
+
+  const nowMin = nowLocal().hour() * 60 + nowLocal().minute();
+  let sent = 0;
+  for (const row of r.rows) {
+    // Resolve the shift to know work_end; skip dayoff / no-config.
+    let workEndMin = null;
+    try {
+      const { config, isDayOff } = await resolveShiftConfig(row.employee_id, row.date);
+      if (isDayOff || !config?.work_end) continue;
+      workEndMin = timeToMin(config.work_end);
+    } catch { continue; }
+
+    // Only ping inside the window. Before the window: too early, they
+    // might be on a long lunch. After: the next-day sweep will handle.
+    const windowStart = workEndMin - 15;
+    const windowEnd   = workEndMin + 30;
+    if (nowMin < windowStart || nowMin > windowEnd) continue;
+
+    await query(
+      `UPDATE attendance_logs
+          SET checkout_reminder_sent_at = NOW(),
+              updated_at = NOW()
+        WHERE id = $1`,
+      [row.id]
+    );
+
+    const empUserId = await userIdFromEmployee(row.employee_id);
+    notify(empUserId, {
+      type: 'attendance_checkout_reminder',
+      title: 'อย่าลืมเช็คเอาท์ก่อนกลับ',
+      body: `ใกล้หมดกะแล้ว — กรุณาเปิดแอปและกดเช็คเอาท์`,
+      link: '/attendance',
+      relatedId: row.id,
+    });
+    sent++;
+  }
+  return sent;
+}
+
+/* ===== HR morning digest (Layer 4) =====
+ *
+ * Once per day on the first /auth/me hit after 08:00 local time, send
+ * HR + owner a roll-up of yesterday's unclosed rows so management can
+ * chase up offline. The digest counts rows where missing_checkout=true
+ * AND date = yesterday — same filter the employee-facing notifications
+ * cover, just aggregated into a single summary.
+ */
+let digestLastRunDay = null;
+async function sendMorningDigest() {
+  const localNow = nowLocal();
+  if (localNow.hour() < 8) return null; // too early
+  const todayKey = localNow.format('YYYY-MM-DD');
+  if (digestLastRunDay === todayKey) return null; // already sent
+  const yesterday = localNow.subtract(1, 'day').format('YYYY-MM-DD');
+
+  const r = await query(
+    `SELECT a.id,
+            CONCAT(e.first_name, ' ', e.last_name) AS emp_name
+       FROM attendance_logs a
+       JOIN employees e ON a.employee_id = e.id
+      WHERE a.date = $1::date
+        AND a.check_in_at IS NOT NULL
+        AND a.check_out_at IS NULL
+        AND e.is_active = true`,
+    [yesterday]
+  );
+  digestLastRunDay = todayKey;
+  if (r.rows.length === 0) return 0;
+
+  // Show up to 5 names inline; the rest is just a count to keep the
+  // notification body within bell-friendly length.
+  const namesPreview = r.rows.slice(0, 5).map(x => x.emp_name).join(', ');
+  const more = r.rows.length > 5 ? ` และอีก ${r.rows.length - 5} คน` : '';
+  await notifyManyByRole(['hr', 'owner'], {
+    type: 'attendance_missing_checkout_admin',
+    title: `เมื่อวานมี ${r.rows.length} คนลืมเช็คเอาท์`,
+    body: `${namesPreview}${more} — กดเพื่อดูและบันทึกเวลาแทนได้`,
+    link: '/attendance',
+  });
+  return r.rows.length;
+}
+
+// Lazy "cron via traffic" wrapper. Three sweeps run on every /auth/me
+// hit but each is gated by its own cadence:
 //
-// Dedupe: process-wide promise so concurrent requests don't trigger
-// parallel sweeps, plus a daily gate (sweepLastRunDay) so even with
-// hundreds of /auth/me hits we only run the actual SQL once per day.
-// The base sweep query is already idempotent — this is a cost cap.
+//   - sweepMissingCheckouts: once per day (flags yesterday's orphans)
+//   - sendMorningDigest:     once per day after 08:00 (HR roll-up)
+//   - sweepCheckoutReminders: every 5 minutes (live near-end nudge)
+//
+// The 5-minute cadence for the reminder is what lets the bell fire
+// inside the work_end ±X-minute window even on Render's free tier
+// (where there's no real cron). Single in-flight slot covers all three
+// to avoid stacking.
 let sweepInFlight = null;
 let sweepLastRunDay = null;
+let reminderLastRunAt = 0;
+const REMINDER_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
 async function runSweepIfDue() {
   if (sweepInFlight) return sweepInFlight;
   const today = nowLocal().format('YYYY-MM-DD');
-  if (sweepLastRunDay === today) return null;
+  const now = Date.now();
+  const needsDaily   = sweepLastRunDay !== today;
+  const needsReminder = (now - reminderLastRunAt) >= REMINDER_INTERVAL_MS;
+  if (!needsDaily && !needsReminder) return null;
+
   sweepInFlight = (async () => {
     try {
-      const marked = await sweepMissingCheckouts();
-      sweepLastRunDay = today;
+      let marked = 0;
+      if (needsDaily) {
+        // Order matters slightly: sweep first so the digest sees the
+        // freshly-flagged rows from today's run too.
+        marked = await sweepMissingCheckouts();
+        await sendMorningDigest();
+        sweepLastRunDay = today;
+      }
+      if (needsReminder) {
+        await sweepCheckoutReminders();
+        reminderLastRunAt = now;
+      }
       return marked;
     } catch (e) {
       console.warn('[sweep-if-due] failed (non-fatal):', e.message);
       return null;
     } finally {
-      // Release the in-flight slot 30s later so a burst dedupes but
-      // the next legitimate day-boundary run isn't blocked.
-      setTimeout(() => { sweepInFlight = null; }, 30_000);
+      // Release the in-flight slot 10s later — fast enough that a new
+      // reminder cadence isn't blocked, slow enough that a single burst
+      // of /auth/me hits dedupes into one run.
+      setTimeout(() => { sweepInFlight = null; }, 10_000);
     }
   })();
   return sweepInFlight;
