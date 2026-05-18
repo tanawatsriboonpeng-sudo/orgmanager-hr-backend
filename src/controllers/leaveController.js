@@ -921,8 +921,23 @@ const adminCreateLeave = async (req, res) => {
     });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
-    console.error('POST /leave/admin-record error:', err.message);
-    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+    console.error('POST /leave/admin-record error:', err.message, err.code, err.constraint);
+    // Endpoint is authorize('hr','owner'), so surfacing a tight error
+    // envelope (Postgres code + constraint name + table/column hints)
+    // is acceptable — same diagnostic pattern as PATCH /ot/:id/approve.
+    // Cut diagnosis time when a legacy prod schema is missing a column
+    // ("undefined column hr_notes" surfaces in one HR retry instead of
+    // hunting Render logs). Full error message stays server-side.
+    res.status(500).json({
+      success: false,
+      message: 'บันทึกการลาย้อนหลังไม่สำเร็จ',
+      debug: {
+        code: err.code,
+        constraint: err.constraint,
+        column: err.column,
+        table: err.table,
+      },
+    });
   } finally {
     client.release();
   }

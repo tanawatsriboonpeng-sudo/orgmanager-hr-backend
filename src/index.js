@@ -768,6 +768,44 @@ async function ensureSchema() {
       ALTER TABLE leave_requests
       ADD COLUMN IF NOT EXISTS document TEXT
     `);
+    // hr_notes was added to the leave_requests CREATE TABLE in migrate.js
+    // a while back, but CREATE TABLE IF NOT EXISTS is a no-op on legacy
+    // prod DBs that pre-date that column. The HR backdate flow
+    // (adminCreateLeave) INSERTs into hr_notes, so a drifted prod
+    // silently 500s on every record-leave-on-behalf attempt. ADD COLUMN
+    // IF NOT EXISTS heals it; safe to re-run.
+    await client.query(`
+      ALTER TABLE leave_requests
+      ADD COLUMN IF NOT EXISTS hr_notes TEXT,
+      ADD COLUMN IF NOT EXISTS approved_by UUID REFERENCES users(id),
+      ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ
+    `);
+    // leave_quotas.UNIQUE(employee_id, leave_type_id, year) — required
+    // by the ON CONFLICT clause in adminCreateLeave's quota upsert. If
+    // a legacy DB doesn't have it, the upsert throws
+    // "no unique or exclusion constraint matching the ON CONFLICT
+    // specification". Adding via a DO block keeps the migration
+    // idempotent across re-runs.
+    await client.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+           WHERE conrelid = 'leave_quotas'::regclass
+             AND contype = 'u'
+             AND conname = 'leave_quotas_employee_id_leave_type_id_year_key'
+        ) THEN
+          BEGIN
+            ALTER TABLE leave_quotas
+            ADD CONSTRAINT leave_quotas_employee_id_leave_type_id_year_key
+            UNIQUE (employee_id, leave_type_id, year);
+          EXCEPTION WHEN duplicate_table OR unique_violation THEN
+            -- An equivalent unique index already exists under a
+            -- different name. Safe to ignore.
+            NULL;
+          END;
+        END IF;
+      END $$;
+    `);
     // leave_types columns added after the initial migrate.js cut. Prod
     // DBs seeded before these landed have rows with no column → the
     // settings UI shows "undefined" until we self-heal.
