@@ -3917,5 +3917,12 @@ router.post('/ai/chat',
   authenticate,
   auditLog('ai_chat', 'ai'),
   aiCtrl.chat);
+// One-shot draft generator used by the /support page's "✨ ขอ AI ช่วย
+// ร่าง" button. Read-only — just generates text. Owner/HR only. No
+// audit row (the eventual respond endpoint audits the actual send;
+// drafts that never get sent shouldn't pollute the log).
+router.post('/ai/draft-ticket-response',
+  authenticate, authorize('hr', 'owner'),
+  aiCtrl.draftTicketResponse);
 
 module.exports = router;
