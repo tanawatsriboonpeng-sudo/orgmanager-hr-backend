@@ -1570,6 +1570,8 @@ router.patch('/employees/:id', authenticate, authorize('hr','owner'),
     contractEndDate, employmentType, startDate,
     // Bank / payroll
     bankBranchCode, paymentMethod,
+    // Recurring payroll deductions — pulled into each new payslip
+    studentLoanId, studentLoanMonthly, depositMonthly, depositAccumulated,
     // Free-form
     notes, hashtags,
   } = req.body
@@ -1673,6 +1675,11 @@ router.patch('/employees/:id', authenticate, authorize('hr','owner'),
          -- Bank / payroll
          bank_branch_code   = COALESCE($36, bank_branch_code),
          payment_method     = COALESCE($37, payment_method),
+         -- Recurring payroll deductions
+         student_loan_id      = COALESCE($40, student_loan_id),
+         student_loan_monthly = COALESCE($41, student_loan_monthly),
+         deposit_monthly      = COALESCE($42, deposit_monthly),
+         deposit_accumulated  = COALESCE($43, deposit_accumulated),
          -- Free-form
          notes              = COALESCE($38, notes),
          hashtags           = COALESCE($39, hashtags),
@@ -1691,6 +1698,11 @@ router.patch('/employees/:id', authenticate, authorize('hr','owner'),
        contractEndDate, employmentType, startDate,
        bankBranchCode, paymentMethod,
        notes, Array.isArray(hashtags) ? hashtags : null,
+       // Recurring deductions ($40–$43)
+       studentLoanId ?? null,
+       studentLoanMonthly ?? null,
+       depositMonthly ?? null,
+       depositAccumulated ?? null,
       ]
     )
 
@@ -2146,9 +2158,14 @@ const PAYROLL_NUMERIC_RULES = {
   otAmount:         { max:  10_000_000, label: 'ค่า OT' },
   bonus:            { max:  50_000_000, label: 'โบนัส' },
   allowances:       { max:  10_000_000, label: 'ค่าตอบแทนอื่น' },
+  commission:       { max:  50_000_000, label: 'ค่านายหน้า' },
+  otherEarnings:    { max:  10_000_000, label: 'เงินได้อื่นๆ' },
   socialSecurity:   { max:     750,     label: 'ประกันสังคม' },
   incomeTax:        { max:  50_000_000, label: 'ภาษีหัก ณ ที่จ่าย' },
   otherDeductions:  { max:  10_000_000, label: 'รายการหักอื่น' },
+  studentLoan:      { max:  10_000_000, label: 'เงินกู้ยืม กยศ./กรอ.' },
+  deposit:          { max:  10_000_000, label: 'เงินประกัน' },
+  absentLateDeduction: { max: 10_000_000, label: 'หักขาด/ลา/มาสาย' },
   workDays:         { max:      31,     label: 'วันทำงาน' },
   absentDays:       { max:      31,     label: 'วันขาด' },
   lateCount:        { max:     200,     label: 'จำนวนสาย' },
@@ -2170,7 +2187,9 @@ router.post('/payroll', authenticate, authorize('hr', 'owner'), async (req, res)
   const {
     employeeId, month, year,
     baseSalary, otAmount, bonus, allowances,
+    commission, otherEarnings,
     socialSecurity, incomeTax, otherDeductions,
+    studentLoan, deposit, absentLateDeduction,
     workDays, absentDays, lateCount, otHours,
     notes,
   } = req.body;
@@ -2184,14 +2203,18 @@ router.post('/payroll', authenticate, authorize('hr', 'owner'), async (req, res)
       `INSERT INTO payroll_records (
          employee_id, month, year,
          base_salary, ot_amount, bonus, allowances,
+         commission, other_earnings,
          social_security, income_tax, other_deductions,
+         student_loan, deposit, absent_late_deduction,
          work_days, absent_days, late_count, ot_hours,
          notes, created_by
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
        RETURNING *`,
       [employeeId, month, year,
        baseSalary, otAmount || 0, bonus || 0, allowances || 0,
+       commission || 0, otherEarnings || 0,
        socialSecurity || 0, incomeTax || 0, otherDeductions || 0,
+       studentLoan || 0, deposit || 0, absentLateDeduction || 0,
        workDays ?? null, absentDays || 0, lateCount || 0, otHours || 0,
        notes || null, req.user.id]
     );
@@ -2209,7 +2232,9 @@ router.post('/payroll', authenticate, authorize('hr', 'owner'), async (req, res)
 router.patch('/payroll/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
   const {
     baseSalary, otAmount, bonus, allowances,
+    commission, otherEarnings,
     socialSecurity, incomeTax, otherDeductions,
+    studentLoan, deposit, absentLateDeduction,
     workDays, absentDays, lateCount, otHours,
     notes, status,
   } = req.body;
@@ -2226,26 +2251,33 @@ router.patch('/payroll/:id', authenticate, authorize('hr', 'owner'), async (req,
     }
     await query(
       `UPDATE payroll_records SET
-         base_salary       = COALESCE($1,  base_salary),
-         ot_amount         = COALESCE($2,  ot_amount),
-         bonus             = COALESCE($3,  bonus),
-         allowances        = COALESCE($4,  allowances),
-         social_security   = COALESCE($5,  social_security),
-         income_tax        = COALESCE($6,  income_tax),
-         other_deductions  = COALESCE($7,  other_deductions),
-         work_days         = COALESCE($8,  work_days),
-         absent_days       = COALESCE($9,  absent_days),
-         late_count        = COALESCE($10, late_count),
-         ot_hours          = COALESCE($11, ot_hours),
-         notes             = COALESCE($12, notes),
-         status            = COALESCE($13, status),
-         paid_at           = CASE WHEN $13 = 'paid' THEN COALESCE(paid_at, NOW())
-                                  WHEN $13 IS NOT NULL AND $13 <> 'paid' THEN NULL
-                                  ELSE paid_at END,
-         updated_at        = NOW()
-       WHERE id = $14`,
+         base_salary           = COALESCE($1,  base_salary),
+         ot_amount             = COALESCE($2,  ot_amount),
+         bonus                 = COALESCE($3,  bonus),
+         allowances            = COALESCE($4,  allowances),
+         commission            = COALESCE($5,  commission),
+         other_earnings        = COALESCE($6,  other_earnings),
+         social_security       = COALESCE($7,  social_security),
+         income_tax            = COALESCE($8,  income_tax),
+         other_deductions      = COALESCE($9,  other_deductions),
+         student_loan          = COALESCE($10, student_loan),
+         deposit               = COALESCE($11, deposit),
+         absent_late_deduction = COALESCE($12, absent_late_deduction),
+         work_days             = COALESCE($13, work_days),
+         absent_days           = COALESCE($14, absent_days),
+         late_count            = COALESCE($15, late_count),
+         ot_hours              = COALESCE($16, ot_hours),
+         notes                 = COALESCE($17, notes),
+         status                = COALESCE($18, status),
+         paid_at               = CASE WHEN $18 = 'paid' THEN COALESCE(paid_at, NOW())
+                                      WHEN $18 IS NOT NULL AND $18 <> 'paid' THEN NULL
+                                      ELSE paid_at END,
+         updated_at            = NOW()
+       WHERE id = $19`,
       [baseSalary ?? null, otAmount ?? null, bonus ?? null, allowances ?? null,
+       commission ?? null, otherEarnings ?? null,
        socialSecurity ?? null, incomeTax ?? null, otherDeductions ?? null,
+       studentLoan ?? null, deposit ?? null, absentLateDeduction ?? null,
        workDays ?? null, absentDays ?? null, lateCount ?? null, otHours ?? null,
        notes ?? null, status ?? null, req.params.id]
     );
@@ -2257,9 +2289,23 @@ router.patch('/payroll/:id', authenticate, authorize('hr', 'owner'), async (req,
 });
 
 // DELETE /payroll/:id — HR/owner deletes. Only allowed when status='draft'.
-router.delete('/payroll/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
+// audit_log middleware fires after the handler so /audit-logs surfaces a
+// payroll_delete row attributed to the user who clicked the button. The
+// response payload includes a snapshot of the deleted record (employee,
+// period, base salary) so the audit row has actionable context even
+// after the underlying DB row is gone.
+router.delete('/payroll/:id', authenticate, authorize('hr', 'owner'),
+  auditLog('payroll_delete', 'payroll_records'),
+  async (req, res) => {
   try {
-    const existing = await query('SELECT status FROM payroll_records WHERE id = $1', [req.params.id]);
+    const existing = await query(
+      `SELECT p.status, p.employee_id, p.month, p.year, p.base_salary,
+              e.first_name, e.last_name
+         FROM payroll_records p
+         LEFT JOIN employees e ON p.employee_id = e.id
+        WHERE p.id = $1`,
+      [req.params.id]
+    );
     if (!existing.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบสลิป' });
     if (existing.rows[0].status !== 'draft') {
       return res.status(400).json({ success: false, message: 'ลบได้เฉพาะสลิปสถานะ "ร่าง" เท่านั้น' });
@@ -2390,7 +2436,10 @@ router.post('/payroll/bulk-generate', authenticate, authorize('hr', 'owner'),
 
     const ins = await query(
       `WITH eligible AS (
-         SELECT e.id AS employee_id, e.base_salary
+         SELECT e.id AS employee_id,
+                e.base_salary,
+                COALESCE(e.student_loan_monthly, 0) AS student_loan_monthly,
+                COALESCE(e.deposit_monthly,      0) AS deposit_monthly
            FROM employees e
            LEFT JOIN users u ON e.user_id = u.id
           WHERE e.is_active = true
@@ -2416,6 +2465,7 @@ router.post('/payroll/bulk-generate', authenticate, authorize('hr', 'owner'),
        INSERT INTO payroll_records (
          employee_id, month, year,
          base_salary, ot_amount, social_security,
+         student_loan, deposit, absent_late_deduction,
          work_days, absent_days, late_count, ot_hours,
          created_by
        )
@@ -2424,6 +2474,13 @@ router.post('/payroll/bulk-generate', authenticate, authorize('hr', 'owner'),
          e.base_salary,
          ROUND(COALESCE(ot.ot_hours,0) * (e.base_salary / 240.0) * 1.5, 2)  AS ot_amount,
          LEAST(ROUND(e.base_salary * 0.05, 2), 750.00)                       AS social_security,
+         e.student_loan_monthly,
+         e.deposit_monthly,
+         -- ขาด/ลา/มาสาย: หัก base_salary/30 ต่อวันที่ขาด + base_salary/30/8 ต่อชม.สาย
+         -- (สมมติเฉลี่ย 30 วัน/เดือน, 8 ชม./วัน). HR override ได้ที่ฟอร์มสลิป.
+         ROUND(
+           (COALESCE(att.absent_days,0) * (e.base_salary / 30.0))
+         , 2) AS absent_late_deduction,
          COALESCE(att.work_days,   0),
          COALESCE(att.absent_days, 0),
          COALESCE(att.late_count,  0),
