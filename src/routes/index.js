@@ -272,6 +272,62 @@ router.get('/ot/my-history', authenticate, async (req, res) => {
   }
 });
 
+// GET /ot/approved-summary?employee_id=X&month=Y&year=Z
+//
+// Returns the approved OT requests that fall within an employee's
+// given month — same filter as the bulk-generate uses to compute
+// payroll_records.ot_hours. The payroll page calls this when HR clicks
+// "↻ ดึงจากคำขอ OT" inside CreateSlipModal / SlipDetailModal so the
+// OT hours + amount fields on the slip auto-fill from real /ot data
+// instead of HR having to do the math themselves. Without this the
+// /ot page and the slip page felt disconnected — a manually-created
+// slip had no way to pull from /ot at all.
+//
+// Permission: HR/owner can query anyone; employees can only see their
+// own (we silently force employee_id back to the caller's own).
+router.get('/ot/approved-summary', authenticate, async (req, res) => {
+  try {
+    const month = parseInt(req.query.month, 10);
+    const year  = parseInt(req.query.year, 10);
+    if (!Number.isFinite(month) || month < 1 || month > 12) {
+      return res.status(400).json({ success: false, message: 'month ไม่ถูกต้อง' });
+    }
+    if (!Number.isFinite(year) || year < 2000 || year > 2100) {
+      return res.status(400).json({ success: false, message: 'year ไม่ถูกต้อง' });
+    }
+
+    // HR/owner gets to specify any employee; everyone else is locked
+    // to their own employees row (so /approved-summary can't be used
+    // to fish for other people's OT detail).
+    let employeeId = req.query.employee_id || null;
+    if (req.user.role !== 'hr' && req.user.role !== 'owner') {
+      const own = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
+      if (!own.rows[0]) return res.json({ success: true, data: { hours: 0, items: [] } });
+      employeeId = own.rows[0].id;
+    }
+    if (!employeeId) {
+      return res.status(400).json({ success: false, message: 'employee_id ไม่ถูกต้อง' });
+    }
+
+    const r = await query(
+      `SELECT id, date, start_time, end_time, hours, rate, reason, status
+         FROM ot_requests
+        WHERE employee_id = $1
+          AND status = 'hr_approved'
+          AND EXTRACT(YEAR  FROM date) = $2
+          AND EXTRACT(MONTH FROM date) = $3
+        ORDER BY date ASC, start_time ASC`,
+      [employeeId, year, month]
+    );
+    const items = r.rows;
+    const hours = items.reduce((acc, it) => acc + Number(it.hours || 0), 0);
+    res.json({ success: true, data: { hours: +hours.toFixed(2), items } });
+  } catch (e) {
+    console.error('GET /ot/approved-summary error:', e.message);
+    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+  }
+});
+
 // Employee self-cancel — only while still pending (not yet approved /
 // rejected / cancelled).
 router.post('/ot/:id/cancel', authenticate, async (req, res) => {
