@@ -202,8 +202,12 @@ const respond = async (req, res) => {
     res.json({ success: true, message: closeAfter ? 'ตอบและปิดเรื่องแล้ว' : 'ตอบเรื่องแล้ว' });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
-    console.error('POST /support/tickets/:id/respond error:', e.message);
-    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+    // Log full stack so Render shows it; include error message in the
+    // response so the operator can paste it back without trawling logs.
+    // This endpoint is HR/owner-only — no risk of leaking sensitive
+    // detail to employees.
+    console.error('POST /support/tickets/:id/respond error:', e);
+    res.status(500).json({ success: false, message: `เกิดข้อผิดพลาด: ${e.message}` });
   } finally {
     client.release();
   }
@@ -243,8 +247,8 @@ const close = async (req, res) => {
     }
     res.json({ success: true, message: 'ปิดเรื่องแล้ว' });
   } catch (e) {
-    console.error('POST /support/tickets/:id/close error:', e.message);
-    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+    console.error('POST /support/tickets/:id/close error:', e);
+    res.status(500).json({ success: false, message: `เกิดข้อผิดพลาด: ${e.message}` });
   }
 };
 
@@ -291,8 +295,8 @@ const reopen = async (req, res) => {
     }
     res.json({ success: true, message: 'เปิดเรื่องใหม่แล้ว' });
   } catch (e) {
-    console.error('POST /support/tickets/:id/reopen error:', e.message);
-    res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
+    console.error('POST /support/tickets/:id/reopen error:', e);
+    res.status(500).json({ success: false, message: `เกิดข้อผิดพลาด: ${e.message}` });
   }
 };
 
