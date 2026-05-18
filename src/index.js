@@ -435,6 +435,38 @@ async function ensureSchema() {
         `ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS ${name} ${type}`
       );
     }
+    // Check-out hardening: mirror the check-in fields so HR has the
+    // same audit trail on the way out as on the way in. Selfie +
+    // distance + method + an offsite path with reason/approval all
+    // parallel the existing check-in columns. check_out_status is
+    // one of 'early' | 'on_time' | 'overtime' — descriptive only
+    // ('overtime' here means "stayed past work_end," NOT approved
+    // OT; payroll still pulls real OT from ot_requests).
+    const checkOutColumns = [
+      ['check_out_selfie',          'TEXT'],
+      ['check_out_distance_m',      'NUMERIC(8,2)'],
+      ['check_out_method',          'VARCHAR(20)'],
+      ['check_out_status',          'VARCHAR(20)'],
+      ['check_out_is_offsite',      'BOOLEAN DEFAULT false'],
+      ['check_out_offsite_reason',  'TEXT'],
+      ['check_out_offsite_status',  'VARCHAR(20)'],
+      ['check_out_offsite_approved_by', 'UUID REFERENCES users(id)'],
+      ['check_out_offsite_approved_at', 'TIMESTAMPTZ'],
+      ['check_out_offsite_reject_reason', 'TEXT'],
+    ];
+    for (const [name, type] of checkOutColumns) {
+      await client.query(
+        `ALTER TABLE attendance_logs ADD COLUMN IF NOT EXISTS ${name} ${type}`
+      );
+    }
+    // Minimum minutes between check-in and check-out before the
+    // checkout is accepted. Default 30 — blocks the "tap in, tap
+    // out 5 minutes later" pattern while still letting half-day
+    // dismissals through (those should go through /leave anyway).
+    await client.query(`
+      ALTER TABLE shift_configs
+      ADD COLUMN IF NOT EXISTS min_work_minutes INT DEFAULT 30
+    `);
     // Payroll. Legacy DBs created before migrate.js added payroll_records
     // won't have this table, so create it defensively on every boot.
     // net_salary is a GENERATED column — Postgres recomputes it on every

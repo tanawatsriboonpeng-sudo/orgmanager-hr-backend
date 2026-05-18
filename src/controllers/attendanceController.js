@@ -329,11 +329,61 @@ const checkIn = async (req, res) => {
   }
 };
 
+// Check-out status bucket — descriptive label only.
+// 'overtime' here = "stayed past work_end," NOT approved OT; payroll
+// still pulls real OT hours from approved ot_requests.
+function calcCheckOutStatus(now, cfg) {
+  if (!cfg || !cfg.work_end) {
+    return { status: 'on_time', detail: 'ออกงาน' };
+  }
+  const totalMin = now.hour() * 60 + now.minute();
+  const workEnd = timeToMin(cfg.work_end);
+  // 5-minute grace either side of work_end so a clock-skewed device
+  // doesn't land in "ออกก่อนเวลา" at exactly work_end.
+  const ON_TIME_GRACE = 5;
+  if (totalMin < workEnd - ON_TIME_GRACE) {
+    return { status: 'early',    detail: 'ออกก่อนเวลา' };
+  }
+  if (totalMin <= workEnd + ON_TIME_GRACE) {
+    return { status: 'on_time',  detail: 'ออกตรงเวลา' };
+  }
+  return { status: 'overtime',   detail: 'อยู่หลังเวลาเลิกงาน' };
+}
+
 // POST /api/attendance/check-out
+//
+// Hardened to mirror check-in: requires a selfie + GPS, validates the
+// radius (with an offsite-reason escape hatch the same way check-in
+// does), and rejects "too soon after check-in" via shift_configs
+// .min_work_minutes (default 30). Stores a descriptive checkout
+// status (early / on_time / overtime) so HR can spot pattern leavers
+// without manually comparing timestamps.
 const checkOut = async (req, res) => {
   try {
-    const { lat, lng } = req.body;
+    const { lat, lng, method = 'gps', selfie, offsite, reason } = req.body;
     const today = nowLocal().format('YYYY-MM-DD');
+
+    // Selfie size guard — same cap as check-in for consistency.
+    if (selfie && typeof selfie === 'string' && selfie.length > 2 * 1024 * 1024) {
+      return res.status(413).json({ success: false, message: 'รูปเซลฟี่ใหญ่เกินไป (สูงสุด ~1.5MB)' });
+    }
+    if (!selfie) {
+      return res.status(400).json({ success: false, message: 'กรุณาถ่ายเซลฟี่ก่อนเช็คเอาท์' });
+    }
+
+    // Off-site path: same rules as check-in — reason + selfie + valid
+    // GPS coords so HR can verify where the employee actually was.
+    if (offsite) {
+      if (!reason || !String(reason).trim()) {
+        return res.status(400).json({ success: false, message: 'กรุณาระบุเหตุผลที่เช็คเอาท์นอกสถานที่' });
+      }
+      if (!lat || !lng) {
+        return res.status(400).json({
+          success: false,
+          message: 'กรุณาเปิด GPS — เช็คเอาท์นอกสถานที่ต้องระบุตำแหน่งจริงเพื่อให้ HR ตรวจสอบ',
+        });
+      }
+    }
 
     const empResult = await query('SELECT id FROM employees WHERE user_id = $1', [req.user.id]);
     if (!empResult.rows[0]) return res.status(404).json({ success: false, message: 'ไม่พบข้อมูลพนักงาน' });
@@ -346,30 +396,93 @@ const checkOut = async (req, res) => {
     if (!log.rows[0]) return res.status(400).json({ success: false, message: 'ยังไม่ได้เช็คอินวันนี้' });
     if (log.rows[0].check_out_at) return res.status(409).json({ success: false, message: 'เช็คเอาท์วันนี้แล้ว' });
 
+    // GPS radius — same logic + escape hatch as check-in.
+    let distanceM = null;
+    let allowedLoc = null;
+    if (method === 'gps' && lat && lng) {
+      allowedLoc = await checkAllowedLocation(lat, lng);
+      distanceM = allowedLoc.distance;
+    }
+    if (!offsite && method === 'gps') {
+      if (!lat || !lng) {
+        return res.status(400).json({ success: false, message: 'กรุณาเปิด GPS' });
+      }
+      if (!allowedLoc?.allowed) {
+        return res.status(400).json({
+          success: false,
+          message: `อยู่นอกรัศมีที่ตั้งสำนักงาน (ใกล้สุด: ${allowedLoc.matchedName} ${distanceM} ม. / รัศมี ${allowedLoc.radius} ม.)`,
+          data: { distance: distanceM, maxRadius: allowedLoc.radius, matchedLocation: allowedLoc.matchedName }
+        });
+      }
+    }
+
     const checkInAt = dayjs(log.rows[0].check_in_at);
     const checkOutAt = nowLocal();
-    const workHours = parseFloat((checkOutAt.diff(checkInAt, 'minute') / 60).toFixed(2));
 
-    // OT is NOT auto-counted from "stayed past 8 hours". The source of
-    // truth for OT is /ot/request rows that HR has approved — coming in
-    // early or leaving late doesn't earn OT on its own. Force ot_hours
-    // to 0 here so payroll never accidentally double-counts (payroll/
-    // bulk-generate already SUMs from ot_requests, so a stale positive
-    // here would just be UI noise — but better to keep the field honest).
+    // Resolve today's shift config so we can both (a) enforce the
+    // min-work-minutes floor and (b) compute the checkout status.
+    const { config: shiftCfg } = await resolveShiftConfig(empId, today);
+    const minWorkMin = shiftCfg?.min_work_minutes ?? 30;
+    const elapsedMin = checkOutAt.diff(checkInAt, 'minute');
+    if (elapsedMin < minWorkMin) {
+      return res.status(400).json({
+        success: false,
+        message: `เพิ่งเช็คอินไป ${elapsedMin} นาที — ต้องอย่างน้อย ${minWorkMin} นาทีก่อนเช็คเอาท์ (ถ้าต้องออกเร็วกรุณายื่นลา)`,
+      });
+    }
+
+    const workHours = parseFloat((checkOutAt.diff(checkInAt, 'minute') / 60).toFixed(2));
+    const { status: checkOutStatus } = calcCheckOutStatus(checkOutAt, shiftCfg);
+
+    // OT stays 0 here — see comment on the previous version. Real OT
+    // is approved /ot/request rows summed by payroll bulk-generate.
+    //
+    // Offsite *checkout* is informational only — the employee already
+    // checked in earlier (which was validated/approved as needed), so
+    // leaving from outside the radius isn't something HR needs to
+    // approve. We log the flag + reason for audit, but skip the
+    // pending queue (different from offsite check-in, where approval
+    // gates the "did they actually work today?" question).
+    const offsiteFlag = !!offsite;
+    const offsiteStatus = offsiteFlag ? 'logged' : null;
     await query(
       `UPDATE attendance_logs SET
-        check_out_at = NOW(), check_out_lat = $1, check_out_lng = $2,
-        work_hours = $3, ot_hours = 0, updated_at = NOW()
-       WHERE employee_id = $4 AND date = $5`,
-      [lat, lng, workHours, empId, today]
+        check_out_at = NOW(),
+        check_out_lat = $1, check_out_lng = $2,
+        check_out_distance_m = $3,
+        check_out_method = $4,
+        check_out_selfie = $5,
+        check_out_status = $6,
+        check_out_is_offsite = $7,
+        check_out_offsite_reason = $8,
+        check_out_offsite_status = $9,
+        work_hours = $10,
+        ot_hours = 0,
+        updated_at = NOW()
+       WHERE employee_id = $11 AND date = $12`,
+      [
+        lat, lng, distanceM, method, selfie,
+        checkOutStatus,
+        offsiteFlag, offsiteFlag ? String(reason).trim() : null, offsiteStatus,
+        workHours, empId, today
+      ]
     );
+
+    // No HR notification for offsite checkout — it's audit-only.
+    // (See comment above on offsiteStatus = 'logged'.)
 
     res.json({
       success: true,
       message: 'เช็คเอาท์สำเร็จ',
-      data: { checkOutAt: checkOutAt.toISOString(), workHours, otHours: 0 }
+      data: {
+        checkOutAt: checkOutAt.toISOString(),
+        workHours,
+        otHours: 0,
+        checkOutStatus,
+      }
     });
   } catch (err) {
+    console.error('POST /attendance/check-out error:', err.message);
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
   }
 };
