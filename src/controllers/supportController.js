@@ -178,18 +178,36 @@ const respond = async (req, res) => {
       return res.status(404).json({ success: false, message: 'ไม่พบเรื่อง' });
     }
     const newStatus = closeAfter ? 'closed' : 'answered';
-    await client.query(
-      `UPDATE support_tickets
-          SET hr_response = $1,
-              responded_by = $2,
-              responded_at = NOW(),
-              status = $3,
-              closed_at = CASE WHEN $3 = 'closed' THEN NOW() ELSE closed_at END,
-              closed_by = CASE WHEN $3 = 'closed' THEN $2 ELSE closed_by END,
-              updated_at = NOW()
-        WHERE id = $4`,
-      [response.trim(), req.user.id, newStatus, req.params.id]
-    );
+    // Split the two paths so Postgres doesn't have to reason about
+    // parameter type inference inside CASE WHEN expressions — that
+    // was the suspected culprit for the 500s some HR users were
+    // seeing on "ตอบ + ปิดเรื่อง." Two separate UPDATEs, same
+    // transaction.
+    if (closeAfter) {
+      await client.query(
+        `UPDATE support_tickets
+            SET hr_response = $1,
+                responded_by = $2,
+                responded_at = NOW(),
+                status = 'closed',
+                closed_at = NOW(),
+                closed_by = $2,
+                updated_at = NOW()
+          WHERE id = $3`,
+        [response.trim(), req.user.id, req.params.id]
+      );
+    } else {
+      await client.query(
+        `UPDATE support_tickets
+            SET hr_response = $1,
+                responded_by = $2,
+                responded_at = NOW(),
+                status = 'answered',
+                updated_at = NOW()
+          WHERE id = $3`,
+        [response.trim(), req.user.id, req.params.id]
+      );
+    }
     await client.query('COMMIT');
 
     notify(exists.rows[0].user_id, {
