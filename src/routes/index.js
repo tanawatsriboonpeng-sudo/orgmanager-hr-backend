@@ -2026,6 +2026,14 @@ router.get('/payroll', authenticate, async (req, res) => {
 });
 
 // GET /payroll/:id — single slip. Employees can only read their own.
+//
+// Response includes `ot_breakdown`: the approved OT requests that fed into
+// this slip's ot_hours/ot_amount. The bulk-generate query sums any
+// ot_request rows where status='hr_approved' AND date is within the slip's
+// month — so we mirror that filter exactly here. If HR manually edited
+// ot_hours/ot_amount on the slip after generation, the breakdown will
+// still reflect the source requests (not the override) — which is the
+// right "trace" semantic.
 router.get('/payroll/:id', authenticate, async (req, res) => {
   try {
     const r = await query(
@@ -2048,6 +2056,22 @@ router.get('/payroll/:id', authenticate, async (req, res) => {
         return res.status(403).json({ success: false, message: 'ไม่มีสิทธิ์ดู' });
       }
     }
+
+    // Pull the approved OT requests that fed this slip's month.
+    // EXTRACT(...) on the `date` column lets PG plan a Seq Scan on the
+    // small ot_requests table; no index needed at current data sizes.
+    const ot = await query(
+      `SELECT id, date, start_time, end_time, hours, rate, reason, status
+         FROM ot_requests
+        WHERE employee_id = $1
+          AND status = 'hr_approved'
+          AND EXTRACT(YEAR  FROM date) = $2
+          AND EXTRACT(MONTH FROM date) = $3
+        ORDER BY date ASC, start_time ASC`,
+      [slip.employee_id, slip.year, slip.month]
+    );
+    slip.ot_breakdown = ot.rows;
+
     res.json({ success: true, data: slip });
   } catch (e) {
     console.error('GET /payroll/:id error:', e.message);
