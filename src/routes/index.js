@@ -3206,6 +3206,67 @@ router.patch('/cleaning/settings', authenticate, authorize('hr', 'owner'),
       [validWeekdays, startTime ?? null, endTime ?? null,
        typeof isActive === 'boolean' ? isActive : null]
     );
+    // Ripple to today's still-editable session. Three cases:
+    //  1. Time changed (startTime / endTime) → patch today's session
+    //     times in place. Inspector won't notice unless they look at
+    //     the header, and reschedules across the day are common.
+    //  2. Today's DOW dropped out of weekdays (or is_active=false) AND
+    //     today is untouched → delete today's session. Without this,
+    //     a stale "today's checklist" lingers and the inspector sees
+    //     work they shouldn't be doing.
+    //  3. Today's DOW newly INCLUDED in weekdays → next GET
+    //     /cleaning/today will lazy-create the session (existing
+    //     behavior), so no action needed here.
+    const todayIso = bangkokDateISO();
+    const todaySess = await query(
+      `SELECT s.id, s.status FROM cleaning_sessions s
+        WHERE s.session_date = $1
+          AND s.status IN ('open', 'rejected')`,
+      [todayIso]
+    );
+    if (todaySess.rows[0]) {
+      const sess = todaySess.rows[0];
+      // (1) Time patch — only if either field was provided in the body.
+      if (startTime || endTime) {
+        await query(
+          `UPDATE cleaning_sessions SET
+             start_time = COALESCE($1, start_time),
+             end_time   = COALESCE($2, end_time),
+             updated_at = NOW()
+           WHERE id = $3`,
+          [startTime || null, endTime || null, sess.id]
+        );
+      }
+      // (2) Today removed from schedule — delete if untouched. We
+      // compute "today's DOW dropped" against the EFFECTIVE settings
+      // after the UPDATE above. Reading them back keeps the logic
+      // simple (no need to merge partial body + existing row).
+      const settingsAfter = await query(
+        `SELECT weekdays, is_active FROM cleaning_settings WHERE id = 1`
+      );
+      const effectiveWeekdays = settingsAfter.rows[0]?.weekdays || [];
+      const effectiveActive = settingsAfter.rows[0]?.is_active !== false;
+      const todayDow = dayjsForNotif.tz(todayIso, APP_TZ).day();
+      const todayShouldRun = effectiveActive && effectiveWeekdays.includes(todayDow);
+      if (!todayShouldRun) {
+        // Untouched = no done_by, no not_done flag, no inspector notes
+        // on ANY item. If the inspector started, keep the session as-is
+        // so we don't erase real work.
+        const inProgress = await query(
+          `SELECT 1 FROM cleaning_session_items
+            WHERE session_id = $1
+              AND (done_by_employee_id IS NOT NULL
+                   OR COALESCE(not_done, false) = true
+                   OR (inspector_note IS NOT NULL AND inspector_note <> ''))
+            LIMIT 1`,
+          [sess.id]
+        );
+        if (inProgress.rows.length === 0) {
+          // Cascade on items via FK ON DELETE CASCADE.
+          await query(`DELETE FROM cleaning_sessions WHERE id = $1`, [sess.id]);
+        }
+      }
+    }
     res.json({ success: true, message: 'บันทึกแล้ว' });
   } catch (e) {
     console.error('PATCH /cleaning/settings error:', e.message);
