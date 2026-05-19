@@ -2187,7 +2187,9 @@ function validatePayrollNumbers(body) {
   return null;
 }
 
-router.post('/payroll', authenticate, authorize('hr', 'owner'), async (req, res) => {
+router.post('/payroll', authenticate, authorize('hr', 'owner'),
+  auditLog('payroll_create', 'payroll_records'),
+  async (req, res) => {
   const {
     employeeId, month, year,
     baseSalary, otAmount, bonus, allowances,
@@ -2233,7 +2235,9 @@ router.post('/payroll', authenticate, authorize('hr', 'owner'), async (req, res)
 });
 
 // PATCH /payroll/:id — HR/owner edits. Disallow edits when status='paid'.
-router.patch('/payroll/:id', authenticate, authorize('hr', 'owner'), async (req, res) => {
+router.patch('/payroll/:id', authenticate, authorize('hr', 'owner'),
+  auditLog('payroll_update', 'payroll_records'),
+  async (req, res) => {
   const {
     baseSalary, otAmount, bonus, allowances,
     commission, otherEarnings,
@@ -2315,7 +2319,22 @@ router.delete('/payroll/:id', authenticate, authorize('hr', 'owner'),
       return res.status(400).json({ success: false, message: 'ลบได้เฉพาะสลิปสถานะ "ร่าง" เท่านั้น' });
     }
     await query('DELETE FROM payroll_records WHERE id = $1', [req.params.id]);
-    res.json({ success: true, message: 'ลบสลิปแล้ว' });
+    // Return the snapshot in response.data so auditLog middleware
+    // can spread it into the audit row's details JSON — otherwise
+    // a deleted draft leaves zero recoverable context in the log
+    // and the audit page just shows "deleted /payroll/:id".
+    const row = existing.rows[0];
+    res.json({
+      success: true,
+      message: 'ลบสลิปแล้ว',
+      data: {
+        employeeId: row.employee_id,
+        employeeName: `${row.first_name || ''} ${row.last_name || ''}`.trim(),
+        month: row.month,
+        year: row.year,
+        baseSalary: row.base_salary,
+      },
+    });
   } catch (err) {
     console.error('DELETE /payroll/:id error:', err.message);
     res.status(500).json({ success: false, message: 'เกิดข้อผิดพลาด' });
@@ -2480,10 +2499,13 @@ router.post('/payroll/bulk-generate', authenticate, authorize('hr', 'owner'),
          LEAST(ROUND(e.base_salary * 0.05, 2), 750.00)                       AS social_security,
          e.student_loan_monthly,
          e.deposit_monthly,
-         -- ขาด/ลา/มาสาย: หัก base_salary/30 ต่อวันที่ขาด + base_salary/30/8 ต่อชม.สาย
-         -- (สมมติเฉลี่ย 30 วัน/เดือน, 8 ชม./วัน). HR override ได้ที่ฟอร์มสลิป.
+         -- ขาด/ลา/มาสาย: หัก base_salary/30 ต่อวันที่ขาด +
+         -- base_salary/30/8 ต่อ "ครั้ง" ที่มาสาย (สมมติ 1 ครั้ง ≈ 1 ชม.).
+         -- 30 วัน/เดือน, 8 ชม./วัน เป็นค่าเฉลี่ยมาตรฐานไทย. HR override
+         -- ได้ที่ฟอร์มสลิป ถ้าใช้สูตรอื่น.
          ROUND(
-           (COALESCE(att.absent_days,0) * (e.base_salary / 30.0))
+             COALESCE(att.absent_days, 0) * (e.base_salary / 30.0)
+           + COALESCE(att.late_count,  0) * (e.base_salary / 30.0 / 8.0)
          , 2) AS absent_late_deduction,
          COALESCE(att.work_days,   0),
          COALESCE(att.absent_days, 0),

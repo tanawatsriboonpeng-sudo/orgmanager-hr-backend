@@ -62,6 +62,20 @@ const auditLog = (action, resource) => {
       // await it here — the response goes out immediately, and any audit
       // failure is logged but doesn't block the user.
       if (data && data.success !== false) {
+        // Include data.data fields (except `id` which is already the
+        // resource_id) so the audit row carries actionable context —
+        // e.g. DELETE /payroll/:id wants the employee + period + amount
+        // snapshot in the log because the underlying row is gone after.
+        // Capped at ~4KB so a chatty endpoint can't bloat the table.
+        let extra = {};
+        if (data.data && typeof data.data === 'object' && !Array.isArray(data.data)) {
+          const { id: _ignore, ...rest } = data.data;
+          try {
+            const s = JSON.stringify(rest);
+            if (s && s.length <= 4096) extra = rest;
+          } catch { /* circular / unserializable — skip */ }
+        }
+        const details = { method: req.method, path: req.path, ...extra };
         query(
           `INSERT INTO audit_logs (user_id, action, resource, resource_id, details, ip_address, device_info)
            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)`,
@@ -70,7 +84,7 @@ const auditLog = (action, resource) => {
             action,
             resource,
             data.data?.id || req.params.id || null,
-            JSON.stringify({ method: req.method, path: req.path }),
+            JSON.stringify(details),
             req.ip || null,
             req.headers['user-agent']?.substring(0, 200) || null,
           ]

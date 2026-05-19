@@ -394,6 +394,13 @@ const checkOut = async (req, res) => {
       [empId, today]
     );
     if (!log.rows[0]) return res.status(400).json({ success: false, message: 'ยังไม่ได้เช็คอินวันนี้' });
+    // Leave-approval + admin attendance writes can create a row with
+    // status='leave' and no check_in_at. Without this guard, dayjs(null)
+    // → invalid → elapsedMin = NaN → bypasses the min-work check AND
+    // persists work_hours = NaN to the DB, poisoning bulk-generate later.
+    if (!log.rows[0].check_in_at) {
+      return res.status(400).json({ success: false, message: 'ยังไม่ได้เช็คอินวันนี้' });
+    }
     if (log.rows[0].check_out_at) return res.status(409).json({ success: false, message: 'เช็คเอาท์วันนี้แล้ว' });
 
     // GPS radius — same logic + escape hatch as check-in.
