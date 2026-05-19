@@ -71,7 +71,10 @@ router.post('/attendance/backdate/:id/approve', authenticate, authorize('owner',
 router.post('/attendance/backdate/:id/reject',  authenticate, authorize('owner', 'hr'), auditLog('backdate_reject',  'attendance_backdate_requests'), attendCtrl.rejectBackdate);
 // Manual trigger for the missing-checkout sweep. Daily-summary also
 // invokes it lazily, so HR usually doesn't need to call this directly.
-router.post('/attendance/sweep-missing-checkouts', authenticate, authorize('owner', 'hr'), attendCtrl.runMissingCheckoutSweep);
+router.post('/attendance/sweep-missing-checkouts',
+  authenticate, authorize('owner', 'hr'),
+  auditLog('attendance_sweep_missing_checkouts', 'attendance_logs'),
+  attendCtrl.runMissingCheckoutSweep);
 // HR / owner manually records check-in/check-out on someone's behalf.
 // Audit-logged so we can see who fabricated which row.
 router.post('/attendance/admin-record', authenticate, authorize('owner', 'hr'), auditLog('attendance_admin_record', 'attendance_logs'), attendCtrl.adminRecord);
@@ -2479,7 +2482,14 @@ router.post('/payroll/bulk-generate', authenticate, authorize('hr', 'owner'),
           GROUP BY employee_id
        ),
        ot AS (
-         SELECT employee_id, COALESCE(SUM(hours),0)::numeric AS ot_hours
+         -- Sum total hours separately from weighted hours so the slip
+         -- still shows "8 ชม." as plain time but the amount column
+         -- honors a per-request rate override (HR set 2× for a
+         -- holiday, 3× for night shift, …). Default 1.5× matches
+         -- the schema default and the legacy formula.
+         SELECT employee_id,
+                COALESCE(SUM(hours),                              0)::numeric AS ot_hours,
+                COALESCE(SUM(hours * COALESCE(rate, 1.5)),        0)::numeric AS weighted_hours
            FROM ot_requests
           WHERE date BETWEEN $1 AND $2
             AND status = 'hr_approved'
@@ -2495,7 +2505,7 @@ router.post('/payroll/bulk-generate', authenticate, authorize('hr', 'owner'),
        SELECT
          e.employee_id, $3::int, $4::int,
          e.base_salary,
-         ROUND(COALESCE(ot.ot_hours,0) * (e.base_salary / 240.0) * 1.5, 2)  AS ot_amount,
+         ROUND(COALESCE(ot.weighted_hours, 0) * (e.base_salary / 240.0), 2)  AS ot_amount,
          LEAST(ROUND(e.base_salary * 0.05, 2), 750.00)                       AS social_security,
          e.student_loan_monthly,
          e.deposit_monthly,

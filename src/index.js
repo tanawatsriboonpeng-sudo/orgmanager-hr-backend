@@ -575,22 +575,50 @@ async function ensureSchema() {
       );
     }
     // net_salary is GENERATED — Postgres won't let us modify the
-    // expression in place. We detect the old (pre-extension) formula
-    // by checking whether it references the new `commission` column;
-    // if not, DROP + recreate with the full sum. Idempotent on
-    // subsequent boots because the second time around the new
-    // formula already references `commission`.
+    // expression in place, so we have to DROP + recreate. Three
+    // shapes the column can be in on boot:
+    //
+    //   A. Doesn't exist            → ADD it
+    //   B. Exists, GENERATED, old   → DROP + ADD with full formula
+    //   C. Exists, GENERATED, new   → leave alone (idempotent path)
+    //   D. Exists, plain numeric    → very old legacy DB. Leave the
+    //      stored numbers alone — dropping would wipe HR-typed
+    //      values. Just rely on the application layer.
+    //
+    // The previous version conflated (A) and (D) by always running
+    // DROP IF EXISTS when the generation expression was empty,
+    // which silently wiped legacy data.
     {
-      const expr = await client.query(`
-        SELECT pg_get_generation_expression(a.attrelid, a.attname) AS expr
+      const meta = await client.query(`
+        SELECT a.attname,
+               a.attgenerated,
+               pg_get_generation_expression(a.attrelid, a.attname) AS expr
           FROM pg_attribute a
          WHERE a.attrelid = 'payroll_records'::regclass
            AND a.attname  = 'net_salary'
-           AND a.attgenerated <> ''
+           AND a.attnum > 0
+           AND NOT a.attisdropped
       `);
-      const current = expr.rows[0]?.expr || '';
-      if (!current.includes('commission')) {
-        await client.query(`ALTER TABLE payroll_records DROP COLUMN IF EXISTS net_salary`);
+      const row = meta.rows[0];
+      const exists      = !!row;
+      const isGenerated = !!row && row.attgenerated !== '';
+      const expr        = row?.expr || '';
+      const isCurrent   = expr.includes('commission');
+
+      if (!exists) {
+        // Case A — fresh table, add with full formula.
+        await client.query(`
+          ALTER TABLE payroll_records
+          ADD COLUMN net_salary NUMERIC(12,2) GENERATED ALWAYS AS (
+              base_salary + ot_amount + bonus + allowances + commission + other_earnings
+            - social_security - income_tax - other_deductions
+            - student_loan - deposit - absent_late_deduction
+          ) STORED
+        `);
+      } else if (isGenerated && !isCurrent) {
+        // Case B — old formula. Safe to DROP because GENERATED
+        // columns hold no source-of-truth data (always recomputed).
+        await client.query(`ALTER TABLE payroll_records DROP COLUMN net_salary`);
         await client.query(`
           ALTER TABLE payroll_records
           ADD COLUMN net_salary NUMERIC(12,2) GENERATED ALWAYS AS (
@@ -600,6 +628,10 @@ async function ensureSchema() {
           ) STORED
         `);
       }
+      // Case C (already current) and Case D (legacy plain column)
+      // both intentionally do nothing here — the new formula is
+      // already present for C, and D's stored data must not be
+      // wiped (it's HR-typed source-of-truth on those older DBs).
     }
     // Singleton org-wide settings (company name, address, etc.).
     // Enforced single-row via PK = 1; everything else is a nullable column.

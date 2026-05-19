@@ -220,12 +220,17 @@ const respond = async (req, res) => {
     res.json({ success: true, message: closeAfter ? 'ตอบและปิดเรื่องแล้ว' : 'ตอบเรื่องแล้ว' });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
-    // Log full stack so Render shows it; include error message in the
-    // response so the operator can paste it back without trawling logs.
-    // This endpoint is HR/owner-only — no risk of leaking sensitive
-    // detail to employees.
-    console.error('POST /support/tickets/:id/respond error:', e);
-    res.status(500).json({ success: false, message: `เกิดข้อผิดพลาด: ${e.message}` });
+    // Generic message + short correlation id. Echoing raw e.message
+    // back to authenticated employees could leak Postgres column /
+    // table names useful for reconnaissance. The full stack still
+    // lands in Render logs against the same ref so on-call can grep
+    // when the user reports the id.
+    const refId = Math.random().toString(36).slice(2, 8).toUpperCase();
+    console.error(`[support/respond ${refId}]`, e);
+    res.status(500).json({
+      success: false,
+      message: `เกิดข้อผิดพลาด (ref: ${refId})`,
+    });
   } finally {
     client.release();
   }
@@ -265,8 +270,12 @@ const close = async (req, res) => {
     }
     res.json({ success: true, message: 'ปิดเรื่องแล้ว' });
   } catch (e) {
-    console.error('POST /support/tickets/:id/close error:', e);
-    res.status(500).json({ success: false, message: `เกิดข้อผิดพลาด: ${e.message}` });
+    const refId = Math.random().toString(36).slice(2, 8).toUpperCase();
+    console.error(`[support/close ${refId}]`, e);
+    res.status(500).json({
+      success: false,
+      message: `เกิดข้อผิดพลาด (ref: ${refId})`,
+    });
   }
 };
 
@@ -313,8 +322,12 @@ const reopen = async (req, res) => {
     }
     res.json({ success: true, message: 'เปิดเรื่องใหม่แล้ว' });
   } catch (e) {
-    console.error('POST /support/tickets/:id/reopen error:', e);
-    res.status(500).json({ success: false, message: `เกิดข้อผิดพลาด: ${e.message}` });
+    const refId = Math.random().toString(36).slice(2, 8).toUpperCase();
+    console.error(`[support/reopen ${refId}]`, e);
+    res.status(500).json({
+      success: false,
+      message: `เกิดข้อผิดพลาด (ref: ${refId})`,
+    });
   }
 };
 

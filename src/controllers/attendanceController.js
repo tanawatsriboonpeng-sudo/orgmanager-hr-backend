@@ -497,12 +497,16 @@ const checkOut = async (req, res) => {
       }
     });
   } catch (err) {
-    // Surface the real cause in the response so the user can tell
-    // us what's failing without trawling Render logs. Endpoint is
-    // employee-self-only (uses req.user.id implicitly), so there's
-    // no PII risk in echoing the message.
-    console.error('POST /attendance/check-out error:', err);
-    res.status(500).json({ success: false, message: `เกิดข้อผิดพลาด: ${err.message}` });
+    // Generate a short correlation id so the user can quote it back
+    // to support and the dev can grep Render logs without having to
+    // echo the raw err.message (which can leak schema/column names
+    // useful for reconnaissance).
+    const refId = Math.random().toString(36).slice(2, 8).toUpperCase();
+    console.error(`[check-out ${refId}]`, err);
+    res.status(500).json({
+      success: false,
+      message: `เกิดข้อผิดพลาด (ref: ${refId})`,
+    });
   }
 };
 
